@@ -1,35 +1,16 @@
 <script setup lang="ts">
 import { ref } from "vue";
 
-defineProps<{
-  modelValue: string;
-  placeholder?: string;
-}>();
-
-const emit = defineEmits<{
-  "update:modelValue": [value: string];
-}>();
-
+defineProps<{ placeholder?: string }>();
+const model = defineModel<string>({ required: true });
 const isVisible = ref(false);
-
-function toggleVisibility() {
-  isVisible.value = !isVisible.value;
-}
-
-function onBlur() {
-  isVisible.value = false;
-}
-
-function onInput(event: Event) {
-  emit("update:modelValue", (event.target as HTMLInputElement).value);
-}
 </script>
 
 <template>
   <div class="password-input">
     <input
       :type="isVisible ? 'text' : 'password'"
-      :value="modelValue"
+      v-model="model"
       :placeholder="placeholder || '••••••••'"
       autocomplete="off"
       data-form-type="other"
@@ -37,14 +18,13 @@ function onInput(event: Event) {
       autocorrect="off"
       autocapitalize="off"
       spellcheck="false"
-      @input="onInput"
-      @blur="onBlur"
+      @blur="isVisible = false"
     />
     <button
       type="button"
       class="eye-btn"
       tabindex="-1"
-      @click="toggleVisibility"
+      @click="isVisible = !isVisible"
     >
       <svg v-if="isVisible" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
         <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
@@ -91,9 +71,8 @@ function onInput(event: Event) {
   border: none;
   cursor: pointer;
   padding: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   border-radius: 4px;
 }
 
