@@ -18,4 +18,10 @@ describe("contact-json", () => {
     expect(parseFirstEmail("")).toBe("");
     expect(parseFirstEmail("[]")).toBe("");
   });
+
+  it("rejects values that do not match the top-level return shape", () => {
+    expect(parseEmails("{}")).toEqual([]);
+    expect(parsePhones("null")).toEqual([]);
+    expect(parseFirstEmail('[{"email":42}]')).toBe("");
+  });
 });

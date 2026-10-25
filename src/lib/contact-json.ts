@@ -1,21 +1,26 @@
-/// Parsers for the JSON-encoded email/phone lists stored on contact
-/// rows (`emails_json` / `phones_json`). Malformed JSON degrades to an
-/// empty list — rows written by older versions or foreign servers must
-/// never break rendering.
-
-export function parseEmails(json: string): { email: string; label: string }[] {
-  try { return JSON.parse(json); } catch { return []; }
-}
-
-export function parsePhones(json: string): { number: string; label: string }[] {
-  try { return JSON.parse(json); } catch { return []; }
-}
-
-export function parseFirstEmail(json: string): string {
+/** Invalid or non-array contact JSON is empty so it cannot break rendering. */
+function parseJsonList<T>(encoded: string): T[] {
   try {
-    const arr = JSON.parse(json) as Array<{ email?: string }>;
-    return arr[0]?.email ?? "";
+    const parsed: unknown = JSON.parse(encoded);
+    return Array.isArray(parsed) ? (parsed as T[]) : [];
   } catch {
-    return "";
+    return [];
   }
+}
+
+export function parseEmails(
+  encoded: string,
+): { email: string; label: string }[] {
+  return parseJsonList(encoded);
+}
+
+export function parsePhones(
+  encoded: string,
+): { number: string; label: string }[] {
+  return parseJsonList(encoded);
+}
+
+export function parseFirstEmail(encoded: string): string {
+  const email = parseJsonList<{ email?: unknown }>(encoded)[0]?.email;
+  return typeof email === "string" ? email : "";
 }
