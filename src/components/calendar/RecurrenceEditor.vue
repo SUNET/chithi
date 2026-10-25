@@ -2,6 +2,7 @@
 import { ref, watch } from "vue";
 import DateInput from "@/components/common/DateInput.vue";
 import Select from "@/components/common/Select.vue";
+import { parseRRule } from "@/lib/rrule";
 
 const freqOptions = [
   { value: "DAILY", label: "day(s)" },
@@ -42,18 +43,19 @@ const dayOptions = [
   { label: "Sun", value: "SU" },
 ];
 
-// Parse existing RRULE
-if (props.modelValue) {
-  const parts: Record<string, string> = {};
-  for (const p of props.modelValue.split(";")) {
-    const [k, v] = p.split("=");
-    if (k && v) parts[k] = v;
+const parsedRule = props.modelValue ? parseRRule(props.modelValue) : null;
+if (parsedRule) {
+  freq.value = parsedRule.freq;
+  interval.value = parsedRule.interval;
+  if (parsedRule.count !== undefined) {
+    endType.value = "count";
+    count.value = parsedRule.count;
   }
-  if (parts.FREQ) freq.value = parts.FREQ;
-  if (parts.INTERVAL) interval.value = parseInt(parts.INTERVAL, 10);
-  if (parts.COUNT) { endType.value = "count"; count.value = parseInt(parts.COUNT, 10); }
-  if (parts.UNTIL) { endType.value = "until"; untilDate.value = parts.UNTIL.slice(0, 8).replace(/(\d{4})(\d{2})(\d{2})/, "$1-$2-$3"); }
-  if (parts.BYDAY) byDays.value = parts.BYDAY.split(",");
+  if (parsedRule.until) {
+    endType.value = "until";
+    untilDate.value = parsedRule.until.toISOString().slice(0, 10);
+  }
+  byDays.value = parsedRule.byday ?? [];
 }
 
 function buildRRule(): string | null {
@@ -70,11 +72,7 @@ function buildRRule(): string | null {
   return rule;
 }
 
-function update() {
-  emit("update:modelValue", buildRRule());
-}
-
-watch([enabled, freq, interval, endType, count, untilDate, byDays], update, { deep: true });
+watch([enabled, freq, interval, endType, count, untilDate, byDays], () => emit("update:modelValue", buildRRule()), { deep: true });
 </script>
 
 <template>

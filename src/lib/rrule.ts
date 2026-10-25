@@ -49,24 +49,23 @@ function isRRuleFrequency(value: string): value is RRuleFrequency {
 export function parseRRule(rrule: string): RRuleParts | null {
   if (!rrule.startsWith("FREQ=")) return null;
 
-  const values: Record<string, string> = {};
-  for (const part of rrule.split(";")) {
-    const [key, value] = part.split("=");
-    if (key && value) values[key] = value;
-  }
+  const values: Record<string, string> = Object.fromEntries(
+    rrule
+      .split(";")
+      .map((part) => part.split("=", 2))
+      .filter(([key, value]) => key && value),
+  );
 
   const frequency = values.FREQ;
   if (!frequency || !isRRuleFrequency(frequency)) return null;
 
   const interval = Number.parseInt(values.INTERVAL || "1", 10);
-  if (!Number.isInteger(interval) || interval < 1) return null;
-
-  const count = values.COUNT
-    ? Number.parseInt(values.COUNT, 10)
-    : undefined;
-  if (count !== undefined && (!Number.isInteger(count) || count < 1)) {
-    return null;
-  }
+  const count = values.COUNT ? Number.parseInt(values.COUNT, 10) : undefined;
+  if (
+    !Number.isInteger(interval) ||
+    interval < 1 ||
+    (count !== undefined && (!Number.isInteger(count) || count < 1))
+  ) return null;
 
   const until = values.UNTIL ? parseRRuleDate(values.UNTIL) : undefined;
   if (until && Number.isNaN(until.getTime())) return null;
@@ -81,13 +80,10 @@ export function parseRRule(rrule: string): RRuleParts | null {
 }
 
 function parseRRuleDate(value: string): Date {
-  if (value.length === 8) {
-    return new Date(
-      `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`,
-    );
-  }
+  const date = `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`;
+  if (value.length === 8) return new Date(date);
   return new Date(
-    `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}T${value.slice(9, 11)}:${value.slice(11, 13)}:${value.slice(13, 15)}Z`,
+    `${date}T${value.slice(9, 11)}:${value.slice(11, 13)}:${value.slice(13, 15)}Z`,
   );
 }
 
