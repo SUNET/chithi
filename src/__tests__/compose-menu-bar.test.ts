@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mount } from "@vue/test-utils";
-import { __setPlatformForTests } from "@/lib/shortcuts";
 
 const { openUrlMock } = vi.hoisted(() => ({ openUrlMock: vi.fn() }));
 vi.mock("@tauri-apps/plugin-opener", () => ({ openUrl: openUrlMock }));
@@ -13,7 +12,7 @@ import pkg from "../../package.json";
 const APP_VERSION = pkg.version as string;
 
 beforeEach(() => {
-  __setPlatformForTests(false);
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
   openUrlMock.mockReset();
   // Clean up any teleported nodes from previous tests so dialog assertions
   // don't pick up stale DOM.
@@ -21,7 +20,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  __setPlatformForTests(null);
+  vi.restoreAllMocks();
 });
 
 function makeWrapper(props: { showCc?: boolean; showBcc?: boolean } = {}) {

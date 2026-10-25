@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mount } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 import { createMemoryHistory, createRouter } from "vue-router";
-import { __setPlatformForTests } from "@/lib/shortcuts";
 import MenuBar from "@/components/common/MenuBar.vue";
 import pkg from "../../package.json";
 
@@ -64,11 +63,11 @@ beforeEach(() => {
   setDecorationsMock.mockReset();
   openUrlMock.mockReset();
   document.body.innerHTML = "";
-  __setPlatformForTests(false);
+  vi.spyOn(navigator, "platform", "get").mockReturnValue("Linux");
 });
 
 afterEach(() => {
-  __setPlatformForTests(null);
+  vi.restoreAllMocks();
 });
 
 describe("MenuBar", () => {

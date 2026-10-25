@@ -1,12 +1,17 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  __setPlatformForTests,
   dispatch,
   formatShortcut,
   matchesShortcut,
 } from "@/lib/shortcuts";
 
-afterEach(() => __setPlatformForTests(null));
+afterEach(() => vi.restoreAllMocks());
+
+function setMacPlatform(mac: boolean): void {
+  vi.spyOn(navigator, "platform", "get").mockReturnValue(
+    mac ? "MacIntel" : "Linux",
+  );
+}
 
 function ev(
   key: string,
@@ -24,31 +29,31 @@ function ev(
 
 describe("formatShortcut", () => {
   it("renders Ctrl+X on non-mac", () => {
-    __setPlatformForTests(false);
+    setMacPlatform(false);
     expect(formatShortcut({ key: "s", ctrl: true })).toBe("Ctrl+S");
   });
 
   it("renders ⌘S on mac", () => {
-    __setPlatformForTests(true);
+    setMacPlatform(true);
     expect(formatShortcut({ key: "s", ctrl: true })).toBe("⌘S");
   });
 
   it("includes Shift segment", () => {
-    __setPlatformForTests(false);
+    setMacPlatform(false);
     expect(formatShortcut({ key: "z", ctrl: true, shift: true })).toBe(
       "Ctrl+Shift+Z",
     );
   });
 
   it("normalises Enter on macOS to ↩", () => {
-    __setPlatformForTests(true);
+    setMacPlatform(true);
     expect(formatShortcut({ key: "Enter", ctrl: true })).toBe("⌘↩");
   });
 });
 
 describe("matchesShortcut", () => {
   it("matches case-insensitively on letter keys", () => {
-    __setPlatformForTests(false);
+    setMacPlatform(false);
     expect(matchesShortcut(ev("S", { ctrl: true }), { key: "s", ctrl: true }))
       .toBe(true);
     expect(matchesShortcut(ev("s", { ctrl: true }), { key: "s", ctrl: true }))
@@ -56,7 +61,7 @@ describe("matchesShortcut", () => {
   });
 
   it("requires the platform-correct primary modifier", () => {
-    __setPlatformForTests(true);
+    setMacPlatform(true);
     // Ctrl alone on macOS does not satisfy the abstract `ctrl: true`.
     expect(matchesShortcut(ev("s", { ctrl: true }), { key: "s", ctrl: true }))
       .toBe(false);
@@ -66,7 +71,7 @@ describe("matchesShortcut", () => {
   });
 
   it("requires modifier flags to match exactly (no extras allowed)", () => {
-    __setPlatformForTests(false);
+    setMacPlatform(false);
     expect(
       matchesShortcut(ev("s", { ctrl: true, shift: true }), {
         key: "s",
@@ -76,7 +81,7 @@ describe("matchesShortcut", () => {
   });
 
   it("matches non-letter keys exactly", () => {
-    __setPlatformForTests(false);
+    setMacPlatform(false);
     expect(matchesShortcut(ev(",", { ctrl: true }), { key: ",", ctrl: true }))
       .toBe(true);
     expect(matchesShortcut(ev("Enter", { ctrl: true }), {
@@ -88,7 +93,7 @@ describe("matchesShortcut", () => {
 
 describe("dispatch", () => {
   it("calls the matching handler and prevents default", () => {
-    __setPlatformForTests(false);
+    setMacPlatform(false);
     const handler = vi.fn();
     const event = ev("w", { ctrl: true });
     const preventDefault = vi.spyOn(event, "preventDefault");
@@ -99,7 +104,7 @@ describe("dispatch", () => {
   });
 
   it("returns false and does not preventDefault for unmatched events", () => {
-    __setPlatformForTests(false);
+    setMacPlatform(false);
     const handler = vi.fn();
     const event = ev("a");
     const preventDefault = vi.spyOn(event, "preventDefault");
@@ -110,7 +115,7 @@ describe("dispatch", () => {
   });
 
   it("first matching binding wins", () => {
-    __setPlatformForTests(false);
+    setMacPlatform(false);
     const first = vi.fn();
     const second = vi.fn();
     dispatch(ev("s", { ctrl: true }), [
