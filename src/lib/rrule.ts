@@ -1,27 +1,34 @@
-/**
- * Simple RRULE expansion for calendar display.
- * Expands a recurrence rule into occurrences within a date range.
- * Handles: FREQ=DAILY|WEEKLY|MONTHLY|YEARLY, INTERVAL, COUNT, UNTIL, BYDAY.
- */
+const RRULE_FREQUENCIES = ["DAILY", "WEEKLY", "MONTHLY", "YEARLY"] as const;
+const DAY_MILLISECONDS = 86_400_000;
+
+type RRuleFrequency = (typeof RRULE_FREQUENCIES)[number];
 
 interface RRuleParts {
-  freq: string;
+  freq: RRuleFrequency;
   interval: number;
   count?: number;
   until?: Date;
   byday?: string[];
 }
 
-/**
- * Recurring events are stored as a single master row; the calendar store
- * expands them into display occurrences whose ids are
- * `<masterId>_<occurrence start ISO>`. These helpers are the single source
- * of truth for that format — minting (occurrenceId) and resolving back
- * (masterEventId / isOccurrenceId) must never drift apart, otherwise
- * occurrences become unclickable or undeletable (see issue with recurring
- * events not reacting to clicks).
- */
-const OCCURRENCE_SUFFIX_RE = /_\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
+interface RRuleOccurrence {
+  start: Date;
+  end: Date;
+}
+
+const WEEKDAYS: Record<string, { index: number; label: string }> = {
+  SU: { index: 0, label: "Sun" },
+  MO: { index: 1, label: "Mon" },
+  TU: { index: 2, label: "Tue" },
+  WE: { index: 3, label: "Wed" },
+  TH: { index: 4, label: "Thu" },
+  FR: { index: 5, label: "Fri" },
+  SA: { index: 6, label: "Sat" },
+};
+
+/** Synthetic occurrences append their UTC start so the master ID is recoverable. */
+const OCCURRENCE_SUFFIX_RE =
+  /_\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/;
 
 export function occurrenceId(masterId: string, start: Date): string {
   return `${masterId}_${start.toISOString()}`;
@@ -31,198 +38,201 @@ export function isOccurrenceId(id: string): boolean {
   return OCCURRENCE_SUFFIX_RE.test(id);
 }
 
-/** Strip the occurrence suffix, returning the DB id of the series master. */
 export function masterEventId(id: string): string {
   return id.replace(OCCURRENCE_SUFFIX_RE, "");
+}
+
+function isRRuleFrequency(value: string): value is RRuleFrequency {
+  return RRULE_FREQUENCIES.includes(value as RRuleFrequency);
 }
 
 export function parseRRule(rrule: string): RRuleParts | null {
   if (!rrule.startsWith("FREQ=")) return null;
 
-  const parts: Record<string, string> = {};
+  const values: Record<string, string> = {};
   for (const part of rrule.split(";")) {
     const [key, value] = part.split("=");
-    if (key && value) parts[key] = value;
+    if (key && value) values[key] = value;
   }
 
-  if (!parts.FREQ) return null;
+  const frequency = values.FREQ;
+  if (!frequency || !isRRuleFrequency(frequency)) return null;
+
+  const interval = Number.parseInt(values.INTERVAL || "1", 10);
+  if (!Number.isInteger(interval) || interval < 1) return null;
+
+  const count = values.COUNT
+    ? Number.parseInt(values.COUNT, 10)
+    : undefined;
+  if (count !== undefined && (!Number.isInteger(count) || count < 1)) {
+    return null;
+  }
+
+  const until = values.UNTIL ? parseRRuleDate(values.UNTIL) : undefined;
+  if (until && Number.isNaN(until.getTime())) return null;
 
   return {
-    freq: parts.FREQ,
-    interval: parseInt(parts.INTERVAL || "1", 10),
-    count: parts.COUNT ? parseInt(parts.COUNT, 10) : undefined,
-    until: parts.UNTIL ? parseRRuleDate(parts.UNTIL) : undefined,
-    byday: parts.BYDAY ? parts.BYDAY.split(",") : undefined,
+    freq: frequency,
+    interval,
+    count,
+    until,
+    byday: values.BYDAY ? values.BYDAY.split(",") : undefined,
   };
 }
 
-function parseRRuleDate(s: string): Date {
-  // UNTIL format: 20260404T235959Z or 20260404
-  if (s.length === 8) {
-    return new Date(`${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}`);
+function parseRRuleDate(value: string): Date {
+  if (value.length === 8) {
+    return new Date(
+      `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}`,
+    );
   }
   return new Date(
-    `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}T${s.slice(9, 11)}:${s.slice(11, 13)}:${s.slice(13, 15)}Z`,
+    `${value.slice(0, 4)}-${value.slice(4, 6)}-${value.slice(6, 8)}T${value.slice(9, 11)}:${value.slice(11, 13)}:${value.slice(13, 15)}Z`,
   );
 }
 
-const dayMap: Record<string, number> = {
-  SU: 0, MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6,
-};
+function periodsToSkip(
+  rule: RRuleParts,
+  current: Date,
+  rangeStart: Date,
+): number {
+  const millisecondsBehind = rangeStart.getTime() - current.getTime();
+  switch (rule.freq) {
+    case "DAILY":
+      return Math.floor(
+        millisecondsBehind / (DAY_MILLISECONDS * rule.interval),
+      );
+    case "WEEKLY":
+      return Math.floor(
+        millisecondsBehind / (7 * DAY_MILLISECONDS * rule.interval),
+      );
+    case "MONTHLY": {
+      const monthsBehind =
+        (rangeStart.getFullYear() - current.getFullYear()) * 12 +
+        rangeStart.getMonth() -
+        current.getMonth();
+      return Math.floor(monthsBehind / rule.interval);
+    }
+    case "YEARLY":
+      return Math.floor(
+        (rangeStart.getFullYear() - current.getFullYear()) / rule.interval,
+      );
+  }
+}
 
-/**
- * Expand a recurring event into occurrences within [rangeStart, rangeEnd].
- * Returns an array of start dates for each occurrence.
- */
+function advanceDate(date: Date, rule: RRuleParts, periods = 1): void {
+  const amount = rule.interval * periods;
+  switch (rule.freq) {
+    case "DAILY":
+      date.setDate(date.getDate() + amount);
+      break;
+    case "WEEKLY":
+      date.setDate(date.getDate() + 7 * amount);
+      break;
+    case "MONTHLY":
+      date.setMonth(date.getMonth() + amount);
+      break;
+    case "YEARLY":
+      date.setFullYear(date.getFullYear() + amount);
+      break;
+  }
+}
+
 export function expandRRule(
   rrule: string,
   eventStart: Date,
   eventEnd: Date,
   rangeStart: Date,
   rangeEnd: Date,
-  maxOccurrences = 500,
-): { start: Date; end: Date }[] {
-  const parsed = parseRRule(rrule);
-  if (!parsed) return [];
+  maxIterations = 500,
+): RRuleOccurrence[] {
+  const rule = parseRRule(rrule);
+  if (!rule) return [];
 
   const duration = eventEnd.getTime() - eventStart.getTime();
-  const occurrences: { start: Date; end: Date }[] = [];
+  const occurrences: RRuleOccurrence[] = [];
   const current = new Date(eventStart);
-  // `count` tracks occurrences elapsed since DTSTART (for the RRULE COUNT
-  // limit); `iterations` caps the loop independently so a fast-forwarded
-  // `count` cannot trip the iteration guard.
   let count = 0;
   let iterations = 0;
 
-  // Fast-forward long-running series. A rule whose DTSTART is far before
-  // the requested window would otherwise spend the whole iteration budget
-  // stepping through history and never reach [rangeStart, rangeEnd].
-  // Advancing by whole periods keeps the occurrence grid (including WEEKLY
-  // BYDAY) aligned; `count` is bumped so the COUNT limit still applies.
+  // Skip whole periods so distant series do not exhaust the iteration limit.
   if (current < rangeStart) {
-    let skip = 0;
-    const msBehind = rangeStart.getTime() - current.getTime();
-    const DAY_MS = 86_400_000;
-    switch (parsed.freq) {
-      case "DAILY":
-        skip = Math.floor(msBehind / (DAY_MS * parsed.interval));
-        if (skip > 0) current.setDate(current.getDate() + skip * parsed.interval);
-        break;
-      case "WEEKLY":
-        skip = Math.floor(msBehind / (7 * DAY_MS * parsed.interval));
-        if (skip > 0)
-          current.setDate(current.getDate() + skip * 7 * parsed.interval);
-        break;
-      case "MONTHLY": {
-        const months =
-          (rangeStart.getFullYear() - current.getFullYear()) * 12 +
-          (rangeStart.getMonth() - current.getMonth());
-        skip = Math.floor(months / parsed.interval);
-        if (skip > 0)
-          current.setMonth(current.getMonth() + skip * parsed.interval);
-        break;
-      }
-      case "YEARLY":
-        skip = Math.floor(
-          (rangeStart.getFullYear() - current.getFullYear()) / parsed.interval,
-        );
-        if (skip > 0)
-          current.setFullYear(current.getFullYear() + skip * parsed.interval);
-        break;
+    const skippedPeriods = periodsToSkip(rule, current, rangeStart);
+    if (skippedPeriods > 0) {
+      advanceDate(current, rule, skippedPeriods);
+      count += skippedPeriods;
     }
-    if (skip > 0) count += skip;
   }
 
-  while (iterations < maxOccurrences) {
-    if (parsed.until && current > parsed.until) break;
-    if (parsed.count !== undefined && count >= parsed.count) break;
+  while (iterations < maxIterations) {
+    if (rule.until && current > rule.until) break;
+    if (rule.count !== undefined && count >= rule.count) break;
     if (current > rangeEnd) break;
 
-    const occEnd = new Date(current.getTime() + duration);
-
-    // Check if this occurrence overlaps the range
-    if (occEnd >= rangeStart && current <= rangeEnd) {
-      // For WEEKLY with BYDAY, check day-of-week
-      if (parsed.freq === "WEEKLY" && parsed.byday) {
-        // Generate all matching days in this week
+    const occurrenceEnd = new Date(current.getTime() + duration);
+    if (occurrenceEnd >= rangeStart && current <= rangeEnd) {
+      if (rule.freq === "WEEKLY" && rule.byday) {
         const weekStart = new Date(current);
         weekStart.setDate(current.getDate() - current.getDay());
-        for (const day of parsed.byday) {
-          const dayNum = dayMap[day];
-          if (dayNum === undefined) continue;
-          const d = new Date(weekStart);
-          d.setDate(weekStart.getDate() + dayNum);
-          d.setHours(eventStart.getHours(), eventStart.getMinutes(), eventStart.getSeconds());
-          const dEnd = new Date(d.getTime() + duration);
-          if (d >= rangeStart && d <= rangeEnd) {
-            occurrences.push({ start: d, end: dEnd });
+        for (const day of rule.byday) {
+          const weekday = WEEKDAYS[day];
+          if (!weekday) continue;
+          const occurrenceStart = new Date(weekStart);
+          occurrenceStart.setDate(weekStart.getDate() + weekday.index);
+          occurrenceStart.setHours(
+            eventStart.getHours(),
+            eventStart.getMinutes(),
+            eventStart.getSeconds(),
+          );
+          if (occurrenceStart >= rangeStart && occurrenceStart <= rangeEnd) {
+            occurrences.push({
+              start: occurrenceStart,
+              end: new Date(occurrenceStart.getTime() + duration),
+            });
           }
         }
       } else {
-        occurrences.push({ start: new Date(current), end: occEnd });
+        occurrences.push({ start: new Date(current), end: occurrenceEnd });
       }
     }
 
-    count++;
-    iterations++;
-
-    // Advance to next occurrence
-    switch (parsed.freq) {
-      case "DAILY":
-        current.setDate(current.getDate() + parsed.interval);
-        break;
-      case "WEEKLY":
-        current.setDate(current.getDate() + 7 * parsed.interval);
-        break;
-      case "MONTHLY":
-        current.setMonth(current.getMonth() + parsed.interval);
-        break;
-      case "YEARLY":
-        current.setFullYear(current.getFullYear() + parsed.interval);
-        break;
-      default:
-        return occurrences;
-    }
+    count += 1;
+    iterations += 1;
+    advanceDate(current, rule);
   }
 
   return occurrences;
 }
 
-/**
- * Human-readable description of an RRULE.
- */
 export function describeRRule(rrule: string): string {
-  const parsed = parseRRule(rrule);
-  if (!parsed) return rrule;
+  const rule = parseRRule(rrule);
+  if (!rule) return rrule;
 
-  let desc = "";
-
-  switch (parsed.freq) {
+  let description = "";
+  switch (rule.freq) {
     case "DAILY":
-      desc = parsed.interval === 1 ? "Daily" : `Every ${parsed.interval} days`;
+      description = rule.interval === 1 ? "Daily" : `Every ${rule.interval} days`;
       break;
     case "WEEKLY":
-      desc = parsed.interval === 1 ? "Weekly" : `Every ${parsed.interval} weeks`;
-      if (parsed.byday) {
-        const dayNames = parsed.byday.map((d) => {
-          const names: Record<string, string> = {
-            MO: "Mon", TU: "Tue", WE: "Wed", TH: "Thu", FR: "Fri", SA: "Sat", SU: "Sun",
-          };
-          return names[d] || d;
-        });
-        desc += ` on ${dayNames.join(", ")}`;
+      description = rule.interval === 1 ? "Weekly" : `Every ${rule.interval} weeks`;
+      if (rule.byday) {
+        const dayNames = rule.byday.map(
+          (day) => WEEKDAYS[day]?.label ?? day,
+        );
+        description += ` on ${dayNames.join(", ")}`;
       }
       break;
     case "MONTHLY":
-      desc = parsed.interval === 1 ? "Monthly" : `Every ${parsed.interval} months`;
+      description =
+        rule.interval === 1 ? "Monthly" : `Every ${rule.interval} months`;
       break;
     case "YEARLY":
-      desc = parsed.interval === 1 ? "Yearly" : `Every ${parsed.interval} years`;
+      description =
+        rule.interval === 1 ? "Yearly" : `Every ${rule.interval} years`;
       break;
   }
 
-  if (parsed.count) desc += `, ${parsed.count} times`;
-  if (parsed.until) desc += `, until ${parsed.until.toLocaleDateString()}`;
-
-  return desc;
+  if (rule.count) description += `, ${rule.count} times`;
+  if (rule.until) description += `, until ${rule.until.toLocaleDateString()}`;
+  return description;
 }

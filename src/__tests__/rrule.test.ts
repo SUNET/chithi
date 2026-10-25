@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  describeRRule,
   expandRRule,
   isOccurrenceId,
   masterEventId,
@@ -106,5 +107,32 @@ describe("expandRRule", () => {
 
   it("does not parse raw JSCalendar rules as iCal RRULEs", () => {
     expect(parseRRule('[{"frequency":"monthly","byMonth":["10"]}]')).toBeNull();
+  });
+});
+
+describe("parseRRule", () => {
+  it.each([
+    "FREQ=HOURLY",
+    "FREQ=DAILY;INTERVAL=0",
+    "FREQ=DAILY;COUNT=0",
+    "FREQ=DAILY;UNTIL=invalid",
+  ])("rejects unsupported or unsafe rule %s", (rule) => {
+    expect(parseRRule(rule)).toBeNull();
+    expect(
+      expandRRule(
+        rule,
+        new Date("2026-05-01T09:00:00Z"),
+        new Date("2026-05-01T10:00:00Z"),
+        new Date("2026-05-01T00:00:00Z"),
+        new Date("2026-05-31T23:59:59Z"),
+      ),
+    ).toEqual([]);
+    expect(describeRRule(rule)).toBe(rule);
+  });
+
+  it("shares weekday labels with weekly expansion", () => {
+    expect(describeRRule("FREQ=WEEKLY;BYDAY=MO,WE")).toBe(
+      "Weekly on Mon, Wed",
+    );
   });
 });
