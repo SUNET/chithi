@@ -16,26 +16,10 @@ const route = useRoute();
 const uiStore = useUiStore();
 const openMenu = ref<string | null>(null);
 
-// Which contents the View menu should render — driven by the active
-// route. Mail and contacts both have meaningful per-view toggles
-// (message-pane layout / threading; contact-pane layout). The
-// calendar route deliberately doesn't get a View menu — its toolbar
-// already exposes Day / Week / Month, and surfacing the same options
-// here would just duplicate that selector. Other views (filters,
-// settings, reader, compose) have no view-menu items, so the View
-// top-level button is hidden entirely rather than show an empty
-// dropdown.
 type ViewMenuContext = "mail" | "contacts" | null;
-const viewMenuContext = computed<ViewMenuContext>(() => {
-  switch (route.name) {
-    case "mail":
-      return "mail";
-    case "contacts":
-      return "contacts";
-    default:
-      return null;
-  }
-});
+const viewMenuContext = computed<ViewMenuContext>(() =>
+  route.name === "mail" || route.name === "contacts" ? route.name : null,
+);
 
 function toggleMenu(name: string) {
   openMenu.value = openMenu.value === name ? null : name;
@@ -45,16 +29,14 @@ function closeMenus() {
   openMenu.value = null;
 }
 
-// --- Actions ----------------------------------------------------------------
-
 function openPreferences() {
   closeMenus();
   router.push("/preferences");
 }
 
-async function quitApp() {
+function quitApp() {
   closeMenus();
-  await invoke("quit_app");
+  return invoke("quit_app");
 }
 
 function setViewMode(mode: MessageViewMode) {
@@ -79,23 +61,21 @@ function openAbout() {
   aboutOpen.value = true;
 }
 
-// --- Shortcut definitions ---------------------------------------------------
-
-const sc = {
+const shortcuts = {
   preferences: { key: ",", ctrl: true } satisfies ShortcutDef,
   quit: { key: "q", ctrl: true } satisfies ShortcutDef,
   toggleThreading: { key: "t", ctrl: true } satisfies ShortcutDef,
 } as const;
 
 const bindings: readonly ShortcutBinding[] = [
-  { ...sc.preferences, handler: openPreferences },
-  { ...sc.quit, handler: quitApp },
-  { ...sc.toggleThreading, handler: toggleThreading },
+  { ...shortcuts.preferences, handler: openPreferences },
+  { ...shortcuts.quit, handler: quitApp },
+  { ...shortcuts.toggleThreading, handler: toggleThreading },
 ];
 
 function onKeyDown(event: KeyboardEvent) {
   const target = event.target;
-  // Don't fight text-editing shortcuts in inputs / textareas / contenteditables.
+  // Leave text-editing shortcuts to editable controls.
   if (target instanceof HTMLElement && target.isContentEditable) return;
   if (target instanceof HTMLInputElement) return;
   if (target instanceof HTMLTextAreaElement) return;
@@ -108,29 +88,23 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
 
 <template>
   <div class="menu-bar" @mouseleave="closeMenus" data-testid="menu-bar">
-    <!-- File menu -->
     <div class="menu-item" @click.stop="toggleMenu('file')">
       <span class="menu-label">File</span>
       <div v-if="openMenu === 'file'" class="menu-dropdown" @click.stop data-testid="menu-file-dropdown">
         <button class="menu-action" data-testid="menu-file-preferences" @click="openPreferences">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Preferences&hellip;</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.preferences) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.preferences) }}</span>
         </button>
         <div class="menu-separator"></div>
         <button class="menu-action" data-testid="menu-file-quit" @click="quitApp">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Quit</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.quit) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.quit) }}</span>
         </button>
       </div>
     </div>
 
-    <!-- View menu \u2014 context-aware. Mail and contacts each have
-         their own per-pane toggles; everywhere else (calendar uses
-         its own toolbar, filters / settings / preferences / reader /
-         compose have nothing to toggle) the View top-level button
-         is hidden so the user doesn't open a menu with nothing in it. -->
     <div
       v-if="viewMenuContext"
       class="menu-item"
@@ -179,7 +153,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
           <button class="menu-action" data-testid="menu-view-threaded" @click="toggleThreading">
             <span class="action-prefix">{{ uiStore.threadingEnabled ? '\u2713' : '\u00A0' }}</span>
             <span class="action-label">Threaded View</span>
-            <span class="action-shortcut">{{ formatShortcut(sc.toggleThreading) }}</span>
+            <span class="action-shortcut">{{ formatShortcut(shortcuts.toggleThreading) }}</span>
           </button>
         </template>
 
@@ -205,7 +179,6 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
       </div>
     </div>
 
-    <!-- Help menu -->
     <div class="menu-item" @click.stop="toggleMenu('help')">
       <span class="menu-label">Help</span>
       <div v-if="openMenu === 'help'" class="menu-dropdown" @click.stop data-testid="menu-help-dropdown">
@@ -287,10 +260,6 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
   text-align: center;
 }
 
-.action-label {
-  /* takes the middle column */
-}
-
 .action-shortcut {
   font-size: 11px;
   color: var(--color-text-muted);
@@ -302,7 +271,6 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
 }
 
 .menu-action-radio .action-prefix {
-  /* nudge so the dot aligns visually inside the indented radio cluster */
   margin-left: -12px;
 }
 
