@@ -6,9 +6,7 @@ import { useUiStore } from "@/stores/ui";
 const router = useRouter();
 const route = useRoute();
 
-// The invites store backs the needs-action badge. It only fetches in the
-// background while the badge preference is enabled (or the Invites view is
-// open), so instantiating it here is cheap when the badge is turned off.
+// Badge fetching stays idle while the preference is disabled.
 const invitesStore = useInvitesStore();
 const uiStore = useUiStore();
 
@@ -34,42 +32,35 @@ const topItems = [
         :data-testid="`nav-${item.name}`"
         @click="router.push(item.path)"
       >
-        <!-- Mail icon -->
         <svg v-if="item.name === 'mail'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <rect x="2" y="4" width="20" height="16" rx="2" />
           <path d="M22 7l-10 6L2 7" />
         </svg>
-        <!-- Calendar icon -->
         <svg v-else-if="item.name === 'calendar'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <rect x="3" y="4" width="18" height="18" rx="2" />
           <path d="M16 2v4M8 2v4M3 10h18" />
         </svg>
-        <!-- Invites icon (calendar with a check) -->
         <svg v-else-if="item.name === 'invites'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 13V6a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2h7" />
           <path d="M16 2v4M8 2v4M3 10h18" />
           <path d="M15 18l2 2 4-4" />
         </svg>
-        <!-- Contacts icon -->
         <svg v-else-if="item.name === 'contacts'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" /><circle cx="9" cy="7" r="4" /><path d="M23 21v-2a4 4 0 0 0-3-3.87" /><path d="M16 3.13a4 4 0 0 1 0 7.75" />
         </svg>
-        <!-- Filters icon -->
         <svg v-else-if="item.name === 'filters'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3" />
         </svg>
-        <!-- OpenPGP icon (key) -->
         <svg v-else-if="item.name === 'openpgp'" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
           <circle cx="8" cy="15" r="4" />
           <path d="M10.85 12.15L19 4" />
           <path d="M18 5l2 2" />
           <path d="M15 8l2 2" />
         </svg>
-        <!-- Unanswered-invite count badge -->
         <span
           v-if="item.name === 'invites' && uiStore.showInviteBadge && invitesStore.needsActionCount > 0"
           class="sidebar-badge"
-          :data-testid="`nav-invites-badge`"
+          data-testid="nav-invites-badge"
         >{{ invitesStore.needsActionCount > 99 ? "99+" : invitesStore.needsActionCount }}</span>
       </button>
     </div>
@@ -115,9 +106,8 @@ const topItems = [
   width: 36px;
   height: 36px;
   border-radius: var(--radius);
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   color: var(--color-text-muted);
   transition: all 0.12s;
 }
