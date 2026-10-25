@@ -1,22 +1,14 @@
 <script setup lang="ts">
-/// Middle pane of the desktop contacts view: search, the multi-select
-/// merge toolbar (#129) and the contact list. Filtering and the
-/// merge-eligibility check live here; selection state and the merge
-/// dialog itself stay in ContactsView. The root keeps the
-/// `contact-list-panel` class so the view's layout-mode rules
-/// (right/bottom split borders) still hit it.
 import { computed } from "vue";
 import type { Contact, ContactBook } from "@/lib/types";
 import { acctColor } from "@/lib/account-colors";
-import { parseEmails } from "@/lib/contact-json";
+import { parseFirstEmail } from "@/lib/contact-json";
 
 const props = defineProps<{
   contacts: Contact[];
   books: ContactBook[];
   selectedContactId: string | null;
   selectedIds: string[];
-  /// Whether a book is selected at all — drives the empty-state row,
-  /// which only renders when a book is open but has no matches.
   hasBook: boolean;
 }>();
 const emit = defineEmits<{
@@ -27,11 +19,8 @@ const emit = defineEmits<{
 
 const search = defineModel<string>("search", { required: true });
 
-// Per-book / per-contact color is derived from the owning account's UID
-// (see src/lib/account-colors.ts) so two books on the same provider get
-// distinct colors.
 function bookAccountId(bookId: string): string {
-  return props.books.find((b) => b.id === bookId)?.account_id ?? "";
+  return props.books.find((book) => book.id === bookId)?.account_id ?? "";
 }
 
 const filteredContacts = computed(() => {
@@ -45,34 +34,30 @@ const filteredContacts = computed(() => {
   );
 });
 
-/// Whether the multi-select toolbar's "Merge" action is enabled.
-/// Only fires when exactly two contacts are selected AND both belong
-/// to the same address book — cross-book merges aren't supported
-/// because the loser's deletion would have to land on a different
-/// remote and the surviving vCard would have to be rewritten across
-/// two backends.
-const canMergeSelected = computed(() => {
-  if (props.selectedIds.length !== 2) return false;
-  const [a, b] = props.selectedIds
-    .map((id) => props.contacts.find((c) => c.id === id))
-    .filter((c): c is Contact => !!c);
-  if (!a || !b) return false;
-  return a.book_id === b.book_id;
-});
-
-const selectedContactNames = computed(() =>
+const selectedContacts = computed(() =>
   props.selectedIds
-    .map((id) => props.contacts.find((c) => c.id === id)?.display_name ?? "")
-    .filter((s) => s.length > 0),
+    .map((id) => props.contacts.find((contact) => contact.id === id))
+    .filter((contact): contact is Contact => contact !== undefined),
 );
 
-/// Resolve the keeper/loser pair (first selected wins) and hand it to
-/// the parent, which snapshots it and opens the merge dialog.
+// Only contacts from the same address book can be merged.
+const canMergeSelected = computed(
+  () =>
+    props.selectedIds.length === 2 &&
+    selectedContacts.value.length === 2 &&
+    selectedContacts.value[0].book_id === selectedContacts.value[1].book_id,
+);
+
+const selectedContactNames = computed(() =>
+  selectedContacts.value
+    .map((contact) => contact.display_name)
+    .filter(Boolean),
+);
+
+// The first selected contact is the keeper.
 function startMerge() {
   if (!canMergeSelected.value) return;
-  const [keeperId, loserId] = props.selectedIds;
-  const keeper = props.contacts.find((c) => c.id === keeperId);
-  const loser = props.contacts.find((c) => c.id === loserId);
+  const [keeper, loser] = selectedContacts.value;
   if (!keeper || !loser) return;
   emit("merge", keeper, loser);
 }
@@ -84,10 +69,6 @@ function startMerge() {
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" /></svg>
       <input v-model="search" type="text" placeholder="Search contacts..." data-testid="contacts-search" />
     </div>
-    <!-- Multi-select merge toolbar (#129). Visible whenever 2+
-         contacts are picked via Ctrl/Cmd-click; the Merge button
-         only enables when exactly two are selected within the
-         same book. -->
     <div
       v-if="selectedIds.length >= 2"
       class="merge-toolbar"
@@ -129,7 +110,7 @@ function startMerge() {
         >{{ contact.display_name.charAt(0).toUpperCase() }}</div>
         <div class="contact-info">
           <span class="contact-name">{{ contact.display_name }}</span>
-          <span class="contact-email">{{ parseEmails(contact.emails_json)[0]?.email ?? "" }}</span>
+          <span class="contact-email">{{ parseFirstEmail(contact.emails_json) }}</span>
           <span v-if="contact.organization" class="contact-org">{{ contact.organization }}</span>
         </div>
       </div>
@@ -164,8 +145,6 @@ function startMerge() {
   color: var(--color-text);
 }
 
-/* Multi-select toolbar above the contact list. Flat strip that
-   appears the moment a second contact is picked via Ctrl/Cmd-click. */
 .merge-toolbar {
   display: flex;
   align-items: center;
@@ -227,9 +206,7 @@ function startMerge() {
   box-shadow: inset 3px 0 0 var(--color-accent);
 }
 
-/* Picked-state highlight for rows in the contact list. Distinct
-   from `.active` (which marks the row currently shown in the
-   detail panel) so multi-select state stays visible. */
+/* Picked rows remain distinct from the active detail row. */
 .contact-row.picked {
   outline: 2px solid var(--color-accent);
   outline-offset: -2px;
@@ -239,11 +216,9 @@ function startMerge() {
   width: 40px;
   height: 40px;
   border-radius: 50%;
-  /* background set inline by acctColor() */
   color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   font-size: 15px;
   font-weight: 600;
   flex-shrink: 0;
