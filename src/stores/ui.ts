@@ -3,21 +3,26 @@ import { computed, ref, watch } from "vue";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import * as api from "@/lib/tauri";
 
-export type MessageViewMode = "right" | "bottom" | "tab" | "none";
+const MESSAGE_VIEW_MODES = ["right", "bottom", "tab", "none"] as const;
+const CONTACT_VIEW_MODES = ["right", "bottom"] as const;
+const THEMES = ["system", "light", "dark"] as const;
+const TIME_FORMATS = ["auto", "12", "24"] as const;
+const VALID_WEEK_STARTS = [0, 1, 6];
 
-const VALID_VIEW_MODES: MessageViewMode[] = ["right", "bottom", "tab", "none"];
+export type MessageViewMode = (typeof MESSAGE_VIEW_MODES)[number];
+export type ContactViewMode = (typeof CONTACT_VIEW_MODES)[number];
+export type Theme = (typeof THEMES)[number];
+export type TimeFormat = (typeof TIME_FORMATS)[number];
+type ComposeKind = "new" | "reply" | "reply-all" | "forward";
 
-/// Where the contact card renders relative to the contact list. Mirrors
-/// MessageViewMode but with a smaller set: contacts don't have tabs
-/// or a "none" mode (selecting a contact always shows it somewhere).
-export type ContactViewMode = "right" | "bottom";
-
-const VALID_CONTACT_VIEW_MODES: ContactViewMode[] = ["right", "bottom"];
-
-const VALID_THEMES: Theme[] = ["system", "light", "dark"];
-export type Theme = "system" | "light" | "dark";
-export type TimeFormat = "auto" | "12" | "24";
-export type ComposeKind = "new" | "reply" | "reply-all" | "forward";
+function storedOption<T extends string>(
+  key: string,
+  options: readonly T[],
+  fallback: T,
+): T {
+  const stored = localStorage.getItem(key) as T | null;
+  return stored && options.includes(stored) ? stored : fallback;
+}
 
 export const useUiStore = defineStore("ui", () => {
   const threadingEnabled = ref(
@@ -27,34 +32,22 @@ export const useUiStore = defineStore("ui", () => {
   const messageListWidth = ref(400);
   const readerVisible = ref(true);
   const messageViewMode = ref<MessageViewMode>(
-    (() => {
-      const stored = localStorage.getItem("chithi-message-view-mode") as MessageViewMode | null;
-      return stored && VALID_VIEW_MODES.includes(stored) ? stored : "right";
-    })(),
+    storedOption("chithi-message-view-mode", MESSAGE_VIEW_MODES, "right"),
   );
   const contactViewMode = ref<ContactViewMode>(
-    (() => {
-      const stored = localStorage.getItem("chithi-contact-view-mode") as ContactViewMode | null;
-      return stored && VALID_CONTACT_VIEW_MODES.includes(stored) ? stored : "right";
-    })(),
+    storedOption("chithi-contact-view-mode", CONTACT_VIEW_MODES, "right"),
   );
   const theme = ref<Theme>(
-    (() => {
-      const stored = localStorage.getItem("chithi-theme") as Theme | null;
-      return stored && VALID_THEMES.includes(stored) ? stored : "system";
-    })(),
+    storedOption("chithi-theme", THEMES, "system"),
   );
 
-  // Reactive mirror of the OS dark-mode preference. The matchMedia handler
-  // writes to this ref so `resolvedTheme` recomputes when the OS toggles
-  // light/dark — without this, the computed would cache the first read.
+  // A ref keeps OS theme changes reactive.
   const systemDark = ref(
     typeof window !== "undefined" && window.matchMedia
       ? window.matchMedia("(prefers-color-scheme: dark)").matches
       : false,
   );
 
-  /** The actually-applied theme. Tracks the OS preference when theme === "system". */
   const resolvedTheme = computed<"light" | "dark">(() => {
     if (theme.value === "system") return systemDark.value ? "dark" : "light";
     return theme.value;
@@ -63,9 +56,6 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.getItem("chithi-decorations") !== "false",
   );
 
-  // Sticky HTML/plain-text preference for the message reader. Default is
-  // plain text (safer, no remote content surprises); flips to whatever the
-  // user last picked so they don't have to re-toggle on every message.
   const preferHtmlBody = ref(
     localStorage.getItem("chithi-prefer-html-body") === "true",
   );
@@ -74,8 +64,6 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.setItem("chithi-prefer-html-body", String(prefer));
   }
 
-  // Whether the sidebar shows a count badge of unanswered invites.
-  // Defaults to on; persisted so the choice survives restarts.
   const showInviteBadge = ref(
     localStorage.getItem("chithi-show-invite-badge") !== "false",
   );
@@ -84,8 +72,7 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.setItem("chithi-show-invite-badge", String(enabled));
   }
 
-  // Week start day: 0 = Sunday, 1 = Monday, 6 = Saturday
-  const VALID_WEEK_STARTS = [0, 1, 6];
+  // 0 = Sunday, 1 = Monday, 6 = Saturday.
   const weekStartDay = ref<number>(
     (() => {
       const stored = parseInt(localStorage.getItem("chithi-week-start-day") || "0", 10);
@@ -93,33 +80,20 @@ export const useUiStore = defineStore("ui", () => {
     })(),
   );
 
-  // Display timezone
-  const _storedTz = localStorage.getItem("chithi-display-timezone");
-  const displayTimezone = ref<string>(_storedTz || "UTC");
+  const storedTimezone = localStorage.getItem("chithi-display-timezone");
+  const displayTimezone = ref<string>(storedTimezone || "UTC");
   const timezoneList = ref<string[]>([]);
 
-  // Time format: "12" (AM/PM), "24" (00-23), or "auto" (follow OS locale).
-  const VALID_TIME_FORMATS: TimeFormat[] = ["auto", "12", "24"];
   const timeFormat = ref<TimeFormat>(
-    (() => {
-      const stored = localStorage.getItem("chithi-time-format") as TimeFormat | null;
-      return stored && VALID_TIME_FORMATS.includes(stored) ? stored : "auto";
-    })(),
+    storedOption("chithi-time-format", TIME_FORMATS, "auto"),
   );
 
-  // Resolved `hour12` value to pass into Intl.DateTimeFormatOptions. `true`
-  // forces 12-hour, `false` forces 24-hour, `undefined` lets the locale
-  // decide (which is what Intl does by default).
+  // Undefined delegates 12/24-hour selection to Intl.
   const hour12 = computed<boolean | undefined>(() => {
     if (timeFormat.value === "12") return true;
     if (timeFormat.value === "24") return false;
     return undefined;
   });
-
-
-  function toggleReader() {
-    readerVisible.value = !readerVisible.value;
-  }
 
   function showReader() {
     readerVisible.value = true;
@@ -132,9 +106,7 @@ export const useUiStore = defineStore("ui", () => {
   function setMessageViewMode(mode: MessageViewMode) {
     messageViewMode.value = mode;
     localStorage.setItem("chithi-message-view-mode", mode);
-    // Picking a non-"none" mode re-enables the reader pane so the user
-    // sees their selection take effect immediately. The reader's close
-    // button still toggles `readerVisible` for per-session dismissal.
+    // Selecting a visible mode reopens a reader hidden for this session.
     if (mode !== "none") {
       readerVisible.value = true;
     }
@@ -145,11 +117,9 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.setItem("chithi-contact-view-mode", mode);
   }
 
-  function setTheme(t: Theme) {
-    theme.value = t;
-    localStorage.setItem("chithi-theme", t);
-    // The data-theme attribute is updated reactively by the watch on
-    // resolvedTheme; no manual DOM write needed here.
+  function setTheme(nextTheme: Theme) {
+    theme.value = nextTheme;
+    localStorage.setItem("chithi-theme", nextTheme);
   }
 
   function setThreading(enabled: boolean) {
@@ -169,30 +139,34 @@ export const useUiStore = defineStore("ui", () => {
     localStorage.setItem("chithi-week-start-day", String(day));
   }
 
-  function setTimeFormat(tf: TimeFormat) {
-    if (!VALID_TIME_FORMATS.includes(tf)) return;
-    timeFormat.value = tf;
-    localStorage.setItem("chithi-time-format", tf);
+  function setTimeFormat(format: TimeFormat) {
+    if (!TIME_FORMATS.includes(format)) return;
+    timeFormat.value = format;
+    localStorage.setItem("chithi-time-format", format);
   }
 
-  function setDisplayTimezone(tz: string) {
-    if (timezoneList.value.length > 0 && !timezoneList.value.includes(tz)) {
-      console.warn(`setDisplayTimezone: unknown timezone '${tz}', ignoring`);
+  function setDisplayTimezone(timezone: string) {
+    if (
+      timezoneList.value.length > 0 &&
+      !timezoneList.value.includes(timezone)
+    ) {
+      console.warn(
+        `setDisplayTimezone: unknown timezone '${timezone}', ignoring`,
+      );
       return;
     }
-    displayTimezone.value = tz;
-    localStorage.setItem("chithi-display-timezone", tz);
+    displayTimezone.value = timezone;
+    localStorage.setItem("chithi-display-timezone", timezone);
   }
 
   async function initTimezone() {
     try {
       timezoneList.value = await api.listTimezones();
-    } catch (e) {
-      console.error("Failed to load timezones:", e);
+    } catch (error) {
+      console.error("Failed to load timezones:", error);
     }
 
-    // Detect OS timezone on first launch (no stored value)
-    if (!_storedTz) {
+    if (!storedTimezone) {
       try {
         const osTimezone = await api.getDefaultTimezone();
         setDisplayTimezone(osTimezone);
@@ -202,28 +176,23 @@ export const useUiStore = defineStore("ui", () => {
     }
   }
 
-  let mediaQueryUnsub: (() => void) | null = null;
+  let stopMediaQuery: (() => void) | null = null;
 
   function initTheme() {
     document.documentElement.setAttribute("data-theme", resolvedTheme.value);
-    // Subscribe to OS dark-mode changes so `systemDark` (and therefore
-    // `resolvedTheme`) updates live; the watch below applies the new
-    // value to the DOM whenever the resolved theme actually changes.
-    if (typeof window !== "undefined" && window.matchMedia && !mediaQueryUnsub) {
-      const mql = window.matchMedia("(prefers-color-scheme: dark)");
-      const onChange = (e: MediaQueryListEvent) => {
-        systemDark.value = e.matches;
+    if (typeof window !== "undefined" && window.matchMedia && !stopMediaQuery) {
+      const mediaQuery = window.matchMedia("(prefers-color-scheme: dark)");
+      const onChange = (event: MediaQueryListEvent) => {
+        systemDark.value = event.matches;
       };
-      mql.addEventListener("change", onChange);
-      mediaQueryUnsub = () => mql.removeEventListener("change", onChange);
+      mediaQuery.addEventListener("change", onChange);
+      stopMediaQuery = () => mediaQuery.removeEventListener("change", onChange);
     }
   }
 
-  // Keep the document attribute in sync with whatever resolvedTheme yields.
-  // Fires for both user-driven (setTheme) and OS-driven (systemDark) changes.
-  watch(resolvedTheme, (next) => {
+  watch(resolvedTheme, (nextTheme) => {
     if (typeof document !== "undefined") {
-      document.documentElement.setAttribute("data-theme", next);
+      document.documentElement.setAttribute("data-theme", nextTheme);
     }
   });
 
@@ -233,19 +202,15 @@ export const useUiStore = defineStore("ui", () => {
     }
   }
 
-  // Operations panel (slide-up from status bar)
   const operationsPanelOpen = ref(false);
 
   function toggleOperationsPanel() {
     operationsPanelOpen.value = !operationsPanelOpen.value;
   }
 
-  // Mobile chrome state — used by MobileShell and friends.
   const composeOpen = ref(false);
   const drawerOpen = ref(false);
-  // Compose context: when a reply/forward is initiated from MobileThreadView
-  // we stash the source message id + intent here so the sheet can prefill
-  // subject / recipients once the rest of the form is built (§8).
+  // Mobile replies retain their source and intent while the sheet opens.
   const composeContext = ref<{ replyTo: string | null; kind: ComposeKind }>(
     { replyTo: null, kind: "new" },
   );
@@ -267,17 +232,11 @@ export const useUiStore = defineStore("ui", () => {
     drawerOpen.value = false;
   }
 
-  // URL currently hovered in a mail/calendar/contact view; rendered in the
-  // status bar so the user can preview where a link will lead before clicking.
   const hoverUrl = ref<string | null>(null);
   function setHoverUrl(url: string | null) {
     hoverUrl.value = url;
   }
 
-  // URL the user activated; when non-null, the global LinkPopup component
-  // shows a chooser (copy / open-untracked / cancel) and clears this back
-  // to null when dismissed. Centralized here so any view can trigger the
-  // popup without each owning its own copy of the modal.
   const linkPopupUrl = ref<string | null>(null);
   function openLinkPopup(url: string) {
     linkPopupUrl.value = url;
@@ -295,7 +254,6 @@ export const useUiStore = defineStore("ui", () => {
     contactViewMode,
     theme,
     resolvedTheme,
-    toggleReader,
     showReader,
     hideReader,
     setMessageViewMode,
