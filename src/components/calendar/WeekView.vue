@@ -1,21 +1,4 @@
 <script setup lang="ts">
-// PERF NOTE (issue #72):
-// Early versions of WeekView rendered the time grid as 24 hour-rows × 8
-// children (1 gutter + 7 day cells) = ~192 cell <div>s, each with its own
-// click / mouseenter / mouseleave / mouseup listeners. First mail→calendar
-// navigation took ~1.7 s end-to-end (beforeEach → first paint), split
-// roughly as:
-//   script-setup → first child onMounted   ~550 ms  (Vue creating the tree)
-//   WeekView nextTick-await in onMounted   ~530 ms  (scheduler settling)
-//   onMounted return → first rAF          ~1100 ms  (browser layout + paint)
-//
-// The current implementation keeps the all-day row and day-header grids
-// small (7 cells each) and draws the hour grid inside a single <div> per
-// day with a CSS repeating-linear-gradient, then captures pointer events
-// on the column directly and derives the hit hour from offsetY. DOM in
-// the grid region drops from ~216 → ~32 leaf nodes; first mail→calendar
-// nav is ~390 ms in the same profile. Combined with <KeepAlive> in
-// App.vue, subsequent mail↔calendar swaps are essentially free (~1-2 ms).
 import { computed, onMounted, onActivated, onUnmounted, ref, nextTick } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
@@ -52,9 +35,7 @@ const uiStore = useUiStore();
 const gridRef = ref<HTMLElement | null>(null);
 
 const hours = Array.from({ length: 24 }, (_, i) => i);
-// Height (px) of one hour-row. Exposed to CSS via the --hour-height custom
-// property on .week-view (see the inline :style binding) so the scoped
-// styles and hit-testing math (hourFromEvent) share a single source.
+// Shared by CSS sizing, event positioning, and pointer hit-testing.
 const HOUR_HEIGHT = 52;
 
 const days = computed(() => {
@@ -84,9 +65,6 @@ function formatDayNum(date: Date): string {
 }
 
 function formatHour(hour: number): string {
-  // Honor the user's time-format preference. For 24-hour we render a
-  // zero-padded hour; for 12-hour we keep the old AM/PM labels; for "auto"
-  // we let Intl pick for the locale.
   const h12 = uiStore.hour12;
   if (h12 === false) {
     return String(hour).padStart(2, "0");
@@ -97,7 +75,6 @@ function formatHour(hour: number): string {
     if (hour === 12) return "12 PM";
     return `${hour - 12} PM`;
   }
-  // auto / locale default
   const d = new Date();
   d.setHours(hour, 0, 0, 0);
   return d.toLocaleTimeString(undefined, { hour: "numeric" });
@@ -121,25 +98,19 @@ function isCurrentHour(hour: number): boolean {
   return todayVisible && getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone) === hour;
 }
 
-// Absolute pixel offset of the current-time line within a day column.
 const nowMarkerTop = computed(() => {
   const hour = getHourInTimezone(now.value.toISOString(), uiStore.displayTimezone);
   const minutes = getMinutesInTimezone(now.value.toISOString(), uiStore.displayTimezone);
   return `${hour * HOUR_HEIGHT + (minutes / 60) * HOUR_HEIGHT}px`;
 });
 
-// A display segment represents one day's portion of an event.
-// Cross-midnight events are split so each day gets its own segment.
+// Cross-midnight events render as one segment per day.
 interface EventSegment {
   event: CalendarEvent;
   segStart: Date;
   segEnd: Date;
 }
 
-// Group timed event segments by day. The previous implementation keyed by
-// (day, hour) because every hour cell was its own DOM node; now events live
-// inside a single day column and are positioned absolutely, so per-hour
-// partitioning is no longer needed.
 const segmentsByDay = computed(() => {
   const map = new Map<string, EventSegment[]>();
 
@@ -172,8 +143,7 @@ function segmentsForDay(date: Date): EventSegment[] {
   return segmentsByDay.value.get(dayStr) || [];
 }
 
-// Precompute overlap layout: for each day, find overlapping events and assign
-// columns so they render side-by-side instead of stacking on top of each other.
+// Assign overlapping events to side-by-side columns.
 interface OverlapInfo {
   column: number;
   totalColumns: number;
@@ -253,8 +223,6 @@ const overlapLayout = computed(() => {
 });
 
 function eventBlockStyle(seg: EventSegment): Record<string, string> {
-  // `top` is now absolute within the day column (column height = 24 * HOUR_HEIGHT),
-  // not relative to an hour cell as before.
   const startHour = getHourInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone);
   const startMin = getMinutesInTimezone(seg.segStart.toISOString(), uiStore.displayTimezone);
   const topOffset = startHour * HOUR_HEIGHT + (startMin / 60) * HOUR_HEIGHT;
@@ -312,8 +280,7 @@ function getEventStyle(event: { my_status: string | null }): Record<string, stri
   return {};
 }
 
-// Compute the clicked/hovered hour from the column's bounding box and the
-// mouse Y coordinate. Clamped to 0..23.
+// Derive a clamped hour from the pointer's vertical column offset.
 function hourFromEvent(e: MouseEvent): number {
   const target = e.currentTarget as HTMLElement;
   const rect = target.getBoundingClientRect();
@@ -329,7 +296,6 @@ function onColumnClick(date: Date, e: MouseEvent) {
   emit("timeClick", dt.toISOString());
 }
 
-// Drag-to-reschedule
 const dragStartPos = ref<{ x: number; y: number } | null>(null);
 const dragGhost = ref<HTMLElement | null>(null);
 const dragOverCell = ref<{ day: string; hour: number } | null>(null);
@@ -451,11 +417,7 @@ function onColumnDrop(day: Date, e: MouseEvent) {
   });
 }
 
-// Center the current time in the viewport on mount, and refresh the
-// "now" ref once per minute so the red current-time line and
-// .current-hour label stay accurate. The interval is per-instance; stored
-// so we can clear it on unmount and not leak when the view toggles
-// between week/day and month.
+// Keep the current-time marker centered and refreshed while mounted.
 async function centerOnNow() {
   now.value = new Date();
   await nextTick();
@@ -470,12 +432,10 @@ onMounted(() => {
   nowIntervalId = setInterval(() => {
     now.value = new Date();
   }, 60000);
-  centerOnNow();
+  void centerOnNow();
 });
 
-// CalendarView is wrapped in <KeepAlive>, so navigating away and back
-// reactivates this cached subtree without re-mounting; re-center so the
-// view doesn't reopen at a stale scroll position.
+// Cached view activation must refresh its scroll position.
 onActivated(centerOnNow);
 
 onUnmounted(() => {
@@ -493,7 +453,6 @@ onUnmounted(() => {
     :data-testid="singleDay ? 'cal-day-view' : 'cal-week-view'"
     :style="{ '--hour-height': `${HOUR_HEIGHT}px` }"
   >
-    <!-- All-day events banner -->
     <div class="all-day-row">
       <div class="time-gutter all-day-label">all-day</div>
       <div
@@ -515,7 +474,6 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Day headers -->
     <div class="day-headers">
       <div class="time-gutter"></div>
       <div
@@ -529,9 +487,6 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <!-- Time grid: one gutter of hour labels + one column per day. Hour grid
-         lines are drawn with a CSS repeating-linear-gradient on each day
-         column, so we don't create 24 × 7 = 168 cell <div>s per mount. -->
     <div ref="gridRef" class="time-grid">
       <div class="time-gutter hour-labels">
         <div
@@ -555,21 +510,18 @@ onUnmounted(() => {
         @mouseleave="onColumnLeave(day)"
         @mouseup="onColumnDrop(day, $event)"
       >
-        <!-- Current time marker — absolute within the today column -->
         <div
           v-if="isToday(day)"
           class="now-marker"
           :style="{ top: nowMarkerTop }"
         ></div>
 
-        <!-- Drag-over hint band -->
         <div
           v-if="dragHintVisible(day)"
           class="drag-hint"
           :style="dragHintStyle"
         ></div>
 
-        <!-- Timed event blocks -->
         <div
           v-for="seg in segmentsForDay(day)"
           :key="seg.event.id + '-' + seg.segStart.toISOString()"
@@ -599,7 +551,6 @@ onUnmounted(() => {
   background: var(--color-bg);
 }
 
-/* All-day row */
 .all-day-row {
   display: flex;
   border-bottom: 2px solid var(--color-border);
@@ -644,7 +595,6 @@ onUnmounted(() => {
   font-weight: 500;
 }
 
-/* Day headers */
 .day-headers {
   display: flex;
   border-bottom: 1px solid var(--color-border);
@@ -704,7 +654,6 @@ onUnmounted(() => {
   opacity: 0.6;
 }
 
-/* Time gutter — single column of 24 hour labels */
 .time-gutter {
   width: 64px;
   flex-shrink: 0;
@@ -716,8 +665,7 @@ onUnmounted(() => {
 }
 
 .hour-label {
-  /* --hour-height is set inline on .week-view from the TS HOUR_HEIGHT
-     constant so cell layout and hourFromEvent() hit-testing stay in sync. */
+  /* Set from HOUR_HEIGHT so layout and hit-testing stay aligned. */
   height: var(--hour-height);
   font-size: 10px;
   color: var(--color-text-muted);
@@ -733,7 +681,6 @@ onUnmounted(() => {
   font-weight: 700;
 }
 
-/* Time grid — flex row of [gutter, 7 day columns] */
 .time-grid {
   flex: 1;
   overflow-y: scroll;
@@ -742,7 +689,6 @@ onUnmounted(() => {
   min-height: 0;
 }
 
-/* Day columns. The hour grid is a CSS gradient rather than 24 cells. */
 .day-column {
   position: relative;
   flex: 1;
@@ -809,7 +755,6 @@ onUnmounted(() => {
   z-index: 1;
 }
 
-/* Event blocks — absolutely positioned within the day column */
 .event-block {
   position: absolute;
   font-size: 11px;
@@ -848,7 +793,6 @@ onUnmounted(() => {
   font-weight: 600;
 }
 
-/* Scrollbar */
 .time-grid::-webkit-scrollbar {
   width: 6px;
 }
