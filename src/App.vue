@@ -11,6 +11,11 @@ import { useUiStore } from "@/stores/ui";
 import { usePlatformStore } from "@/stores/platform";
 import { usePgpPromptsStore } from "@/stores/pgp-prompts";
 
+const DEFAULT_ZOOM_LEVEL = 1;
+const MIN_ZOOM_LEVEL = 0.5;
+const MAX_ZOOM_LEVEL = 2;
+const ZOOM_STEP = 0.1;
+
 const accountsStore = useAccountsStore();
 const uiStore = useUiStore();
 const platformStore = usePlatformStore();
@@ -19,36 +24,49 @@ const pgpPrompts = usePgpPromptsStore();
 const { isMobile } = storeToRefs(platformStore);
 const { currentPrompt } = storeToRefs(pgpPrompts);
 
+let zoomLevel = DEFAULT_ZOOM_LEVEL;
+
+function handleZoomShortcut(event: KeyboardEvent) {
+  if (!(event.ctrlKey || event.metaKey)) return;
+
+  let nextZoomLevel: number;
+  switch (event.key) {
+    case "=":
+    case "+":
+      nextZoomLevel = zoomLevel + ZOOM_STEP;
+      break;
+    case "-":
+      nextZoomLevel = zoomLevel - ZOOM_STEP;
+      break;
+    case "0":
+      nextZoomLevel = DEFAULT_ZOOM_LEVEL;
+      break;
+    default:
+      return;
+  }
+
+  event.preventDefault();
+  zoomLevel = Math.min(
+    MAX_ZOOM_LEVEL,
+    Math.max(MIN_ZOOM_LEVEL, nextZoomLevel),
+  );
+  document.documentElement.style.zoom = String(zoomLevel);
+}
+
 onMounted(async () => {
   uiStore.initTheme();
   uiStore.initDecorations();
+
+  // WebKitGTK ignores zoomHotkeysEnabled, so handle zoom shortcuts here.
+  window.addEventListener("keydown", handleZoomShortcut);
+
   await uiStore.initTimezone();
   await accountsStore.fetchAccounts();
-  // Subscribe globally so any view that triggers a sign/decrypt can
-  // receive its prompt.
   await pgpPrompts.start();
-
-  // Zoom with Ctrl+/Ctrl- (WebKitGTK doesn't support zoomHotkeysEnabled)
-  let zoomLevel = 1.0;
-  window.addEventListener("keydown", (e) => {
-    if (!(e.ctrlKey || e.metaKey)) return;
-    if (e.key === "=" || e.key === "+") {
-      e.preventDefault();
-      zoomLevel = Math.min(zoomLevel + 0.1, 2.0);
-      document.documentElement.style.zoom = String(zoomLevel);
-    } else if (e.key === "-") {
-      e.preventDefault();
-      zoomLevel = Math.max(zoomLevel - 0.1, 0.5);
-      document.documentElement.style.zoom = String(zoomLevel);
-    } else if (e.key === "0") {
-      e.preventDefault();
-      zoomLevel = 1.0;
-      document.documentElement.style.zoom = "1";
-    }
-  });
 });
 
 onUnmounted(() => {
+  window.removeEventListener("keydown", handleZoomShortcut);
   pgpPrompts.stop();
 });
 </script>
@@ -59,16 +77,11 @@ onUnmounted(() => {
     <MobileShell v-else />
   </div>
   <ToastContainer />
-  <!-- Global PGP secret prompts. The head of the queue is rendered;
-       when it resolves the next prompt (if any) takes its place. -->
   <PassphraseDialog
-    v-if="currentPrompt && currentPrompt.kind === 'passphrase'"
+    v-if="currentPrompt?.kind === 'passphrase'"
     :prompt="currentPrompt"
   />
-  <PinDialog
-    v-if="currentPrompt && currentPrompt.kind === 'pin'"
-    :prompt="currentPrompt"
-  />
+  <PinDialog v-if="currentPrompt?.kind === 'pin'" :prompt="currentPrompt" />
 </template>
 
 <style scoped>
