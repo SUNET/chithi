@@ -1,12 +1,4 @@
 <script setup lang="ts">
-/// The entire mobile contacts layout: large-title app bar, search,
-/// account filter chips, and the flat A–Z list with sticky letter
-/// headers and the edge index rail. Owns the cross-book flat list and
-/// its loader; the view keeps data ownership of the books and routes
-/// `select` through the same handler as the desktop list (which also
-/// resets multi-select and mirrors the store). The search input binds
-/// to the view-owned query via v-model so the shared-ref behavior
-/// survives if the platform ever flips at runtime.
 import { computed, ref, watch } from "vue";
 import { useAccountsStore } from "@/stores/accounts";
 import type { Contact, ContactBook } from "@/lib/types";
@@ -23,24 +15,21 @@ const search = defineModel<string>("search", { required: true });
 
 const accountsStore = useAccountsStore();
 
-// Which account the list is filtered to ("all" or an account id).
-const mobileAccountFilter = ref<string>("all");
+const mobileAccountFilter = ref("all");
 
-// Flatten every contact across every book so the mobile list can be
-// sorted alphabetically and filtered by account. Desktop still uses the
-// per-book sidebar.
+// Mobile combines every book into one account-filterable list.
 const allContactsFlat = ref<Array<Contact & { _accountId: string }>>([]);
 
 async function loadAllContacts() {
   const collected: Array<Contact & { _accountId: string }> = [];
   for (const book of props.books) {
     try {
-      const list = await api.listContacts(book.id);
-      for (const c of list) {
-        collected.push({ ...c, _accountId: book.account_id });
+      const contacts = await api.listContacts(book.id);
+      for (const contact of contacts) {
+        collected.push({ ...contact, _accountId: book.account_id });
       }
-    } catch (e) {
-      console.error("mobile contacts load failed:", e);
+    } catch (error) {
+      console.error("mobile contacts load failed:", error);
     }
   }
   collected.sort((a, b) =>
@@ -49,9 +38,7 @@ async function loadAllContacts() {
   allContactsFlat.value = collected;
 }
 
-watch(() => props.books, () => {
-  loadAllContacts();
-});
+watch(() => props.books, loadAllContacts);
 
 const filteredMobileContacts = computed(() => {
   let list = allContactsFlat.value;
@@ -69,7 +56,6 @@ const filteredMobileContacts = computed(() => {
   return list;
 });
 
-// Group contacts by their first letter for sticky section headers.
 interface LetterGroup {
   letter: string;
   items: typeof filteredMobileContacts.value;
@@ -89,9 +75,12 @@ const letterGroups = computed<LetterGroup[]>(() => {
   });
 });
 
-const indexRailLetters = computed(() =>
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZ#".split(""),
-);
+const indexRailLetters = [..."ABCDEFGHIJKLMNOPQRSTUVWXYZ#"];
+
+function accountColorStyle(accountId: string): Record<string, string> {
+  const { fill, soft } = acctColor(accountId);
+  return { "--account-fill": fill, "--account-soft": soft };
+}
 
 function mobileContactInitial(c: Contact): string {
   return (c.display_name.trim().charAt(0) || "?").toUpperCase();
@@ -115,7 +104,6 @@ function mobileContactInitial(c: Contact): string {
       </template>
     </MobileAppBar>
 
-    <!-- Search -->
     <div class="mobile-search">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="11" cy="11" r="8" />
@@ -124,7 +112,6 @@ function mobileContactInitial(c: Contact): string {
       <input v-model="search" type="search" placeholder="Search contacts" />
     </div>
 
-    <!-- Account filter chips -->
     <div class="mobile-chips" role="tablist">
       <button
         class="chip"
@@ -140,10 +127,6 @@ function mobileContactInitial(c: Contact): string {
         :class="{ active: mobileAccountFilter === account.id }"
         role="tab"
         :aria-selected="mobileAccountFilter === account.id"
-        :style="{
-          '--chip-color': acctColor(account.id).fill,
-          '--chip-soft': acctColor(account.id).soft,
-        } as Record<string, string>"
         @click="mobileAccountFilter = account.id"
       >
         <span class="chip-dot" :style="{ background: acctColor(account.id).fill }" />
@@ -151,7 +134,6 @@ function mobileContactInitial(c: Contact): string {
       </button>
     </div>
 
-    <!-- List with sticky letter headers + edge rail -->
     <div class="mobile-list-wrap">
       <div class="mobile-list">
         <template v-for="group in letterGroups" :key="group.letter">
@@ -164,18 +146,15 @@ function mobileContactInitial(c: Contact): string {
             class="mobile-row"
             @click="emit('select', contact)"
           >
-            <span class="mobile-row-avatar-wrap">
+            <span
+              class="mobile-row-avatar-wrap"
+              :style="accountColorStyle(contact._accountId)"
+            >
               <span
                 class="mobile-row-avatar"
-                :style="{
-                  background: acctColor(contact._accountId).soft,
-                  color: acctColor(contact._accountId).fill,
-                  boxShadow: 'inset 0 0 0 1.5px ' + acctColor(contact._accountId).fill,
-                }"
               >{{ mobileContactInitial(contact) }}</span>
               <span
                 class="mobile-row-dot"
-                :style="{ background: acctColor(contact._accountId).fill }"
                 aria-hidden="true"
               />
             </span>
@@ -193,7 +172,6 @@ function mobileContactInitial(c: Contact): string {
         </div>
       </div>
 
-      <!-- Edge index rail -->
       <nav class="index-rail" aria-label="Jump to letter">
         <a
           v-for="letter in indexRailLetters"
@@ -266,7 +244,6 @@ function mobileContactInitial(c: Contact): string {
   border: 1px solid var(--color-border);
   border-radius: 999px;
   background: transparent;
-  font-family: inherit;
   font-size: 13px;
   color: var(--color-text);
 }
@@ -326,7 +303,6 @@ function mobileContactInitial(c: Contact): string {
   border-bottom: 1px solid var(--color-border);
   background: transparent;
   text-align: left;
-  cursor: pointer;
 }
 
 .mobile-row:active {
@@ -344,9 +320,11 @@ function mobileContactInitial(c: Contact): string {
   width: 38px;
   height: 38px;
   border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
+  background: var(--account-soft);
+  color: var(--account-fill);
+  box-shadow: inset 0 0 0 1.5px var(--account-fill);
   font-size: 14px;
   font-weight: 600;
 }
@@ -358,6 +336,7 @@ function mobileContactInitial(c: Contact): string {
   width: 12px;
   height: 12px;
   border-radius: 50%;
+  background: var(--account-fill);
   box-shadow: 0 0 0 2px var(--color-bg);
 }
 
@@ -404,7 +383,6 @@ function mobileContactInitial(c: Contact): string {
   align-items: center;
   justify-content: center;
   padding: 4px 0;
-  pointer-events: auto;
 }
 
 .index-rail a {
