@@ -244,17 +244,17 @@ describe("pgp store — search", () => {
     await store.fetchKeys();
     expect(store.filteredKeys).toHaveLength(2);
 
-    store.setSearch("alice");
+    store.searchQuery = "alice";
     expect(store.filteredKeys.map((k) => k.fingerprint)).toEqual([
       alice.fingerprint,
     ]);
 
-    store.setSearch("BBBB"); // matches fingerprint prefix, case-insensitive
+    store.searchQuery = "BBBB"; // matches fingerprint prefix, case-insensitive
     expect(store.filteredKeys.map((k) => k.fingerprint)).toEqual([
       bob.fingerprint,
     ]);
 
-    store.setSearch("");
+    store.searchQuery = "";
     expect(store.filteredKeys).toHaveLength(2);
   });
 });
