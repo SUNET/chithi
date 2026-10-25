@@ -13,6 +13,7 @@ import "./assets/styles/main.css";
 const STARTUP_ATTEMPTS = 2;
 const STARTUP_RETRY_DELAY_MS = 50;
 const STARTUP_ATTEMPT_TIMEOUT_MS = 750;
+const BACKGROUND_RETRY_INITIAL_DELAY_MS = 1_000;
 const BACKGROUND_RETRY_MAX_DELAY_MS = 30_000;
 
 const app = createApp(App);
@@ -21,9 +22,11 @@ app.use(pinia);
 app.use(router);
 
 const activityStore = useActivityStore(pinia);
+const initializeActivityListeners = (signal: AbortSignal) =>
+  activityStore.initEventListeners(signal);
 const activityInitializationError =
   await initializeActivityListenersWithRetry(
-    (signal) => activityStore.initEventListeners(signal),
+    initializeActivityListeners,
     STARTUP_ATTEMPTS,
     STARTUP_RETRY_DELAY_MS,
     STARTUP_ATTEMPT_TIMEOUT_MS,
@@ -43,29 +46,27 @@ if (activityInitializationError !== null) {
     0,
   );
 
-  const scheduleRetry = (delayMs: number) => {
-    window.setTimeout(() => {
-      void initializeActivityListenersWithRetry(
-        (signal) => activityStore.initEventListeners(signal),
+  const retryActivityListeners = async () => {
+    let delayMs = BACKGROUND_RETRY_INITIAL_DELAY_MS;
+
+    while (true) {
+      await new Promise<void>((resolve) => window.setTimeout(resolve, delayMs));
+      const error = await initializeActivityListenersWithRetry(
+        initializeActivityListeners,
         1,
         0,
         STARTUP_ATTEMPT_TIMEOUT_MS,
-      )
-        .then((error) => {
-          if (error === null) {
-            dismissToast(unavailableToastId);
-            showToast("Background activity updates restored", "success");
-            return;
-          }
-          console.error("Activity listener retry failed:", error);
-          scheduleRetry(Math.min(delayMs * 2, BACKGROUND_RETRY_MAX_DELAY_MS));
-        })
-        .catch((error) => {
-          console.error("Unexpected activity listener retry failure:", error);
-          scheduleRetry(Math.min(delayMs * 2, BACKGROUND_RETRY_MAX_DELAY_MS));
-        });
-    }, delayMs);
+      );
+      if (error === null) {
+        dismissToast(unavailableToastId);
+        showToast("Background activity updates restored", "success");
+        return;
+      }
+
+      console.error("Activity listener retry failed:", error);
+      delayMs = Math.min(delayMs * 2, BACKGROUND_RETRY_MAX_DELAY_MS);
+    }
   };
 
-  scheduleRetry(1000);
+  void retryActivityListeners();
 }
