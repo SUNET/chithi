@@ -4,19 +4,6 @@ import { useUiStore } from "@/stores/ui";
 
 const activityStore = useActivityStore();
 const uiStore = useUiStore();
-
-function statusIcon(status: string): string {
-  switch (status) {
-    case "running":
-      return "spinner";
-    case "done":
-      return "check";
-    case "error":
-      return "error";
-    default:
-      return "info";
-  }
-}
 </script>
 
 <template>
@@ -44,16 +31,13 @@ function statusIcon(status: string): string {
           :class="op.status"
           data-testid="op-row"
         >
-          <span class="op-icon" :class="statusIcon(op.status)">
-            <!-- Spinner -->
+          <span class="op-icon">
             <svg v-if="op.status === 'running'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="spin">
               <path d="M21 12a9 9 0 1 1-6.22-8.56" />
             </svg>
-            <!-- Check -->
             <svg v-else-if="op.status === 'done'" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <polyline points="20 6 9 17 4 12" />
             </svg>
-            <!-- Error -->
             <svg v-else width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="10" /><line x1="15" y1="9" x2="9" y2="15" /><line x1="9" y1="9" x2="15" y2="15" />
             </svg>
@@ -96,9 +80,8 @@ function statusIcon(status: string): string {
 }
 
 .panel-close {
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   width: 20px;
   height: 20px;
   border-radius: 4px;
@@ -142,15 +125,15 @@ function statusIcon(status: string): string {
   align-items: center;
 }
 
-.op-icon.check {
+.op-row.done .op-icon {
   color: #059669;
 }
 
-.op-icon.error {
+.op-row.error .op-icon {
   color: var(--color-danger);
 }
 
-.op-icon.spinner {
+.op-row.running .op-icon {
   color: var(--color-accent);
 }
 
@@ -201,7 +184,6 @@ function statusIcon(status: string): string {
   letter-spacing: 0.5px;
 }
 
-/* Slide-up transition */
 .panel-slide-enter-active,
 .panel-slide-leave-active {
   transition: max-height 0.2s ease, opacity 0.2s ease;
