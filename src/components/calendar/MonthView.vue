@@ -2,7 +2,11 @@
 import { computed, ref, onUnmounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
-import { getDateInTimezone } from "@/lib/datetime";
+import {
+  getDateInTimezone,
+  getHourInTimezone,
+  getMinutesInTimezone,
+} from "@/lib/datetime";
 import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging, canDragCalendarEvent } from "@/lib/calendar-drag-state";
@@ -43,22 +47,12 @@ function getEventsForDay(date: Date) {
   return calendarStore.visibleEvents.filter((e) => {
     const eStartDay = getDateInTimezone(e.start_time, uiStore.displayTimezone);
     const eEndDay = getDateInTimezone(e.end_time, uiStore.displayTimezone);
-    // Include events that start on or before this day and end on or after this day
-    // Events ending exactly at midnight (00:00) are excluded from spilling to next day
     if (eStartDay <= dayStr && eEndDay >= dayStr) {
-      // All-day events always match if date overlaps
       if (e.all_day) return true;
-      // Exclude events that end at exactly midnight of this day (they belong to prev day)
+      // A midnight end is exclusive and belongs to the previous day.
       if (eEndDay === dayStr) {
-        const eEnd = new Date(e.end_time);
-        const endHour = parseInt(
-          eEnd.toLocaleString("en-US", { hour: "numeric", hour12: false, timeZone: uiStore.displayTimezone }),
-          10,
-        );
-        const endMin = parseInt(
-          eEnd.toLocaleString("en-US", { minute: "numeric", timeZone: uiStore.displayTimezone }),
-          10,
-        );
+        const endHour = getHourInTimezone(e.end_time, uiStore.displayTimezone);
+        const endMin = getMinutesInTimezone(e.end_time, uiStore.displayTimezone);
         return endHour !== 0 || endMin !== 0;
       }
       return true;
@@ -78,7 +72,6 @@ const dayNames = computed(() => {
   return [...allDayNames.slice(s), ...allDayNames.slice(0, s)];
 });
 
-// Drag-to-reschedule
 const dragStartPos = ref<{ x: number; y: number } | null>(null);
 const dragGhost = ref<HTMLElement | null>(null);
 const dragOverDay = ref<string | null>(null);
@@ -168,7 +161,6 @@ function onCellDrop(day: Date) {
   const originalEnd = new Date(ev.end_time);
   const durationMs = originalEnd.getTime() - originalStart.getTime();
 
-  // Keep same time-of-day, change the date
   const newStart = new Date(day);
   newStart.setHours(originalStart.getHours(), originalStart.getMinutes(), 0, 0);
   const newEnd = new Date(newStart.getTime() + durationMs);
