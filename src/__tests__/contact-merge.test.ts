@@ -1,9 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
-  mergeContacts,
   defaultChoices,
   applyMergeChoices,
-  buildListItems,
 } from "@/lib/contact-merge";
 import type { Contact } from "@/lib/types";
 
@@ -26,11 +24,15 @@ function makeContact(overrides: Partial<Contact>): Contact {
   } as Contact;
 }
 
-describe("mergeContacts", () => {
+function mergeWithDefaults(keeper: Contact, loser: Contact): Contact {
+  return applyMergeChoices(keeper, loser, defaultChoices(keeper, loser));
+}
+
+describe("default contact merge", () => {
   it("keeps the primary's identity fields", () => {
     const a = makeContact({ id: "a", uid: "uid-a", remote_id: "rem-a", etag: "et-a", book_id: "b1" });
     const b = makeContact({ id: "b", uid: "uid-b", remote_id: "rem-b", etag: "et-b", book_id: "b1" });
-    const merged = mergeContacts(a, b);
+    const merged = mergeWithDefaults(a, b);
     expect(merged.id).toBe("a");
     expect(merged.uid).toBe("uid-a");
     expect(merged.remote_id).toBe("rem-a");
@@ -41,7 +43,7 @@ describe("mergeContacts", () => {
   it("primary atomic fields win when populated", () => {
     const a = makeContact({ display_name: "Alice", organization: "Acme", title: "Engineer" });
     const b = makeContact({ display_name: "Alicia", organization: "Beta", title: "Manager" });
-    const merged = mergeContacts(a, b);
+    const merged = mergeWithDefaults(a, b);
     expect(merged.display_name).toBe("Alice");
     expect(merged.organization).toBe("Acme");
     expect(merged.title).toBe("Engineer");
@@ -50,7 +52,7 @@ describe("mergeContacts", () => {
   it("falls through to secondary when primary's atomic field is empty", () => {
     const a = makeContact({ display_name: "Alice", organization: "", title: null });
     const b = makeContact({ display_name: "Alicia", organization: "Beta", title: "Manager" });
-    const merged = mergeContacts(a, b);
+    const merged = mergeWithDefaults(a, b);
     // display_name stays primary (non-empty)
     expect(merged.display_name).toBe("Alice");
     // organization / title fall through
@@ -70,7 +72,7 @@ describe("mergeContacts", () => {
         { email: "b@example.com", label: "other" },
       ]),
     });
-    const merged = mergeContacts(a, b);
+    const merged = mergeWithDefaults(a, b);
     const emails = JSON.parse(merged.emails_json);
     expect(emails).toHaveLength(2);
     expect(emails[0].email).toBe("a@example.com"); // primary's casing wins
@@ -87,7 +89,7 @@ describe("mergeContacts", () => {
         { number: "+1-555-2222", label: "work" },
       ]),
     });
-    const merged = mergeContacts(a, b);
+    const merged = mergeWithDefaults(a, b);
     const phones = JSON.parse(merged.phones_json);
     expect(phones).toHaveLength(2);
     expect(phones[0].number).toBe("+1-555-1111");
@@ -97,24 +99,24 @@ describe("mergeContacts", () => {
   it("concatenates notes with a separator when both differ", () => {
     const a = makeContact({ notes: "Met at conference 2024." });
     const b = makeContact({ notes: "Likes hiking." });
-    const merged = mergeContacts(a, b);
+    const merged = mergeWithDefaults(a, b);
     expect(merged.notes).toBe("Met at conference 2024.\n---\nLikes hiking.");
   });
 
   it("keeps the single non-empty notes when only one side has them", () => {
     const a = makeContact({ notes: null });
     const b = makeContact({ notes: "Likes hiking." });
-    expect(mergeContacts(a, b).notes).toBe("Likes hiking.");
+    expect(mergeWithDefaults(a, b).notes).toBe("Likes hiking.");
 
     const c = makeContact({ notes: "Met at conference 2024." });
     const d = makeContact({ notes: "" });
-    expect(mergeContacts(c, d).notes).toBe("Met at conference 2024.");
+    expect(mergeWithDefaults(c, d).notes).toBe("Met at conference 2024.");
   });
 
   it("does not duplicate identical notes", () => {
     const a = makeContact({ notes: "Same note." });
     const b = makeContact({ notes: "Same note." });
-    expect(mergeContacts(a, b).notes).toBe("Same note.");
+    expect(mergeWithDefaults(a, b).notes).toBe("Same note.");
   });
 
   it("survives malformed JSON in either list (treats as empty)", () => {
@@ -122,7 +124,7 @@ describe("mergeContacts", () => {
     const b = makeContact({
       emails_json: JSON.stringify([{ email: "b@example.com", label: "work" }]),
     });
-    const merged = mergeContacts(a, b);
+    const merged = mergeWithDefaults(a, b);
     const emails = JSON.parse(merged.emails_json);
     expect(emails).toHaveLength(1);
     expect(emails[0].email).toBe("b@example.com");
@@ -134,7 +136,7 @@ describe("mergeContacts", () => {
     const b = makeContact({
       addresses_json: JSON.stringify([sameAddr, { street: "2 Other", city: "Town", country: "US" }]),
     });
-    const merged = mergeContacts(a, b);
+    const merged = mergeWithDefaults(a, b);
     const addrs = JSON.parse(merged.addresses_json);
     expect(addrs).toHaveLength(2);
   });
@@ -205,12 +207,19 @@ describe("defaultChoices / applyMergeChoices", () => {
     ]);
   });
 
-  it("buildListItems annotates each entry with its source side and dedupes case-insensitively", () => {
-    const items = buildListItems(
-      JSON.stringify([{ email: "k@x.com" }]),
-      JSON.stringify([{ email: "K@X.com" }, { email: "l2@x.com" }]),
-      (it) => String(it.email ?? ""),
+  it("annotates each list entry with its source and dedupes case-insensitively", () => {
+    const choices = defaultChoices(
+      makeContact({
+        emails_json: JSON.stringify([null, "invalid", { email: "k@x.com" }]),
+      }),
+      makeContact({
+        emails_json: JSON.stringify([
+          { email: "K@X.com" },
+          { email: "l2@x.com" },
+        ]),
+      }),
     );
+    const items = choices.emails;
     expect(items).toHaveLength(2); // "K@X.com" collapses against "k@x.com"
     expect(items[0].source).toBe("keeper");
     expect(items[0].item.email).toBe("k@x.com"); // keeper's casing wins

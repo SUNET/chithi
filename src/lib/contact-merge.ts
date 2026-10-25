@@ -1,48 +1,14 @@
-/**
- * Contact-merge helpers (#129).
- *
- * Pure functions extracted from ContactsView.vue so the merge rules
- * can be unit-tested without mounting the component. The view's
- * field-by-field picker imports `defaultChoices` (to seed the
- * dialog) and `applyMergeChoices` (to derive the surviving record
- * once the user confirms). `mergeContacts` is a legacy wrapper
- * around `applyMergeChoices(defaultChoices(...))` kept for callers
- * that just want the keeper-wins-with-dedup behaviour.
- *
- * Merge policy: "keeper wins" on atomic fields, with empty-string
- * fall-through to the loser so the picked side never produces a
- * blank field as a side effect of the dialog default. Lists
- * (emails, phones, addresses) are unioned with case-folded dedup
- * on the canonical key, with each item flagged include/exclude in
- * `MergeChoices`. Notes get a 3-way `keeper | loser | both` choice;
- * "both" concatenates with a `\n---\n` separator.
- */
-
 import type { Contact } from "./types";
 
-interface EmailEntry { email?: string; label?: string }
-interface PhoneEntry { number?: string; label?: string }
+type AtomicSide = "keeper" | "loser";
+type NotesSide = AtomicSide | "both";
 
-/// Which side a field-by-field merge should pull a value from.
-/// "keeper" = the contact whose id / remote_id / etag survive the
-/// merge. "loser" = the one being deleted. "both" only applies to
-/// notes — concatenate the two with a separator.
-export type AtomicSide = "keeper" | "loser";
-export type NotesSide = "keeper" | "loser" | "both";
-
-/// One entry in the unioned list shown in the picker. Each item
-/// carries the source side (so the UI can show a label) and an
-/// `include` flag for the checkbox.
-export interface MergeListItem {
+interface MergeListItem {
   source: AtomicSide;
   include: boolean;
-  /// Raw item from the original JSON (email entry, phone entry, …).
   item: Record<string, unknown>;
 }
 
-/// Full picker state. The dialog populates this from the two
-/// contacts; `applyMergeChoices` consumes it to produce the
-/// surviving record.
 export interface MergeChoices {
   display_name: AtomicSide;
   organization: AtomicSide;
@@ -53,22 +19,19 @@ export interface MergeChoices {
   addresses: MergeListItem[];
 }
 
-function trimOrNull(s: string | null | undefined): string | null {
-  const t = (s ?? "").trim();
-  return t.length > 0 ? t : null;
+function trimOrNull(value: string | null | undefined): string | null {
+  const trimmed = (value ?? "").trim();
+  return trimmed || null;
 }
 
-function side(
+function selectAtomicValue(
   choice: AtomicSide,
   keeper: string | null | undefined,
   loser: string | null | undefined,
 ): string | null {
-  // If the picked side is empty, fall through to the other so the
-  // user never ends up with a blank field as a side effect of the
-  // dialog defaulting to one side.
-  const picked = choice === "keeper" ? keeper : loser;
+  const selected = choice === "keeper" ? keeper : loser;
   const fallback = choice === "keeper" ? loser : keeper;
-  return trimOrNull(picked) ?? trimOrNull(fallback);
+  return trimOrNull(selected) ?? trimOrNull(fallback);
 }
 
 function mergeNotes(
@@ -76,57 +39,63 @@ function mergeNotes(
   keeper: string | null | undefined,
   loser: string | null | undefined,
 ): string | null {
-  const k = trimOrNull(keeper);
-  const l = trimOrNull(loser);
+  const keeperNotes = trimOrNull(keeper);
+  const loserNotes = trimOrNull(loser);
   switch (choice) {
     case "keeper":
-      return k ?? l;
+      return keeperNotes ?? loserNotes;
     case "loser":
-      return l ?? k;
-    case "both": {
-      if (!k) return l;
-      if (!l || k === l) return k;
-      return `${k}\n---\n${l}`;
-    }
+      return loserNotes ?? keeperNotes;
+    case "both":
+      if (!keeperNotes) return loserNotes;
+      if (!loserNotes || keeperNotes === loserNotes) return keeperNotes;
+      return `${keeperNotes}\n---\n${loserNotes}`;
   }
 }
 
-function parseList<T = Record<string, unknown>>(json: string): T[] {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseList(encoded: string): Record<string, unknown>[] {
   try {
-    const parsed = JSON.parse(json);
-    return Array.isArray(parsed) ? (parsed as T[]) : [];
+    const parsed: unknown = JSON.parse(encoded);
+    return Array.isArray(parsed) ? parsed.filter(isRecord) : [];
   } catch {
     return [];
   }
 }
 
-/// Build a default `MergeListItem[]` for a list field (emails /
-/// phones / addresses): union of keeper + loser, deduped by the
-/// supplied canonical key, with all entries pre-checked. Keeper's
-/// items come first so the picker UI shows them on top.
-export function buildListItems(
+function buildListItems(
   keeperJson: string,
   loserJson: string,
   key: (item: Record<string, unknown>) => string,
 ): MergeListItem[] {
   const items: MergeListItem[] = [];
   const seen = new Set<string>();
-  const push = (raw: Record<string, unknown>, source: AtomicSide) => {
-    const k = key(raw).trim().toLowerCase();
-    if (!k || seen.has(k)) return;
-    seen.add(k);
-    items.push({ source, include: true, item: raw });
-  };
-  for (const it of parseList(keeperJson)) push(it, "keeper");
-  for (const it of parseList(loserJson)) push(it, "loser");
+
+  for (const [encoded, source] of [
+    [keeperJson, "keeper"],
+    [loserJson, "loser"],
+  ] as const) {
+    for (const item of parseList(encoded)) {
+      const canonicalKey = key(item).trim().toLowerCase();
+      if (!canonicalKey || seen.has(canonicalKey)) continue;
+      seen.add(canonicalKey);
+      items.push({ source, include: true, item });
+    }
+  }
+
   return items;
 }
 
-/// Turn an opinion-laden `MergeChoices` into the final Contact
-/// record that gets pushed via `update_contact`. Identity fields
-/// (id, book_id, uid, remote_id, etag, vcard_data) always come
-/// from `keeper` so the merged record points at the existing
-/// remote object.
+function serializeIncludedItems(items: MergeListItem[]): string {
+  return JSON.stringify(
+    items.filter((item) => item.include).map((item) => item.item),
+  );
+}
+
+/** Applies merge choices while preserving the keeper's identity fields. */
 export function applyMergeChoices(
   keeper: Contact,
   loser: Contact,
@@ -135,63 +104,63 @@ export function applyMergeChoices(
   return {
     ...keeper,
     display_name:
-      side(choices.display_name, keeper.display_name, loser.display_name)
-      ?? keeper.display_name,
-    organization: side(choices.organization, keeper.organization, loser.organization),
-    title: side(choices.title, keeper.title, loser.title),
+      selectAtomicValue(
+        choices.display_name,
+        keeper.display_name,
+        loser.display_name,
+      ) ?? keeper.display_name,
+    organization: selectAtomicValue(
+      choices.organization,
+      keeper.organization,
+      loser.organization,
+    ),
+    title: selectAtomicValue(choices.title, keeper.title, loser.title),
     notes: mergeNotes(choices.notes, keeper.notes, loser.notes),
-    emails_json: JSON.stringify(
-      choices.emails.filter((it) => it.include).map((it) => it.item),
-    ),
-    phones_json: JSON.stringify(
-      choices.phones.filter((it) => it.include).map((it) => it.item),
-    ),
-    addresses_json: JSON.stringify(
-      choices.addresses.filter((it) => it.include).map((it) => it.item),
-    ),
+    emails_json: serializeIncludedItems(choices.emails),
+    phones_json: serializeIncludedItems(choices.phones),
+    addresses_json: serializeIncludedItems(choices.addresses),
   };
 }
 
-/// Default choices for two contacts: keeper-wins on each atomic
-/// field unless the keeper's value is empty (then default to the
-/// loser); `notes` defaults to `both` only when both sides have
-/// non-empty differing notes, otherwise keeper. List items default
-/// to all included.
+function defaultAtomicSide(
+  keeper: string | null | undefined,
+  loser: string | null | undefined,
+): AtomicSide {
+  if (trimOrNull(keeper)) return "keeper";
+  return trimOrNull(loser) ? "loser" : "keeper";
+}
+
+function defaultNotesSide(
+  keeper: string | null | undefined,
+  loser: string | null | undefined,
+): NotesSide {
+  const keeperNotes = trimOrNull(keeper);
+  const loserNotes = trimOrNull(loser);
+  if (!keeperNotes) return "loser";
+  if (!loserNotes || keeperNotes === loserNotes) return "keeper";
+  return "both";
+}
+
 export function defaultChoices(keeper: Contact, loser: Contact): MergeChoices {
-  const pick = (a: string | null | undefined, b: string | null | undefined): AtomicSide =>
-    trimOrNull(a) ? "keeper" : trimOrNull(b) ? "loser" : "keeper";
-
-  const k = trimOrNull(keeper.notes);
-  const l = trimOrNull(loser.notes);
-  const notes: NotesSide = !k ? "loser" : !l || k === l ? "keeper" : "both";
-
   return {
-    display_name: pick(keeper.display_name, loser.display_name),
-    organization: pick(keeper.organization, loser.organization),
-    title: pick(keeper.title, loser.title),
-    notes,
+    display_name: defaultAtomicSide(keeper.display_name, loser.display_name),
+    organization: defaultAtomicSide(keeper.organization, loser.organization),
+    title: defaultAtomicSide(keeper.title, loser.title),
+    notes: defaultNotesSide(keeper.notes, loser.notes),
     emails: buildListItems(
       keeper.emails_json,
       loser.emails_json,
-      (it) => String((it as EmailEntry).email ?? ""),
+      (item) => String(item.email ?? ""),
     ),
     phones: buildListItems(
       keeper.phones_json,
       loser.phones_json,
-      (it) => String((it as PhoneEntry).number ?? ""),
+      (item) => String(item.number ?? ""),
     ),
     addresses: buildListItems(
       keeper.addresses_json,
       loser.addresses_json,
-      (it) => JSON.stringify(it),
+      (item) => JSON.stringify(item),
     ),
   };
-}
-
-/// Convenience wrapper: legacy API that auto-resolves to keeper-wins
-/// defaults. Kept so the existing call site can stay compact in the
-/// non-interactive code path; callers that want field-by-field
-/// control should use `defaultChoices` + `applyMergeChoices`.
-export function mergeContacts(keeper: Contact, loser: Contact): Contact {
-  return applyMergeChoices(keeper, loser, defaultChoices(keeper, loser));
 }
