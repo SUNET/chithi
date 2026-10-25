@@ -8,7 +8,7 @@ import {
 } from "@/lib/shortcuts";
 import AboutDialog from "@/components/common/AboutDialog.vue";
 
-const props = defineProps<{
+defineProps<{
   showCc: boolean;
   showBcc: boolean;
 }>();
@@ -23,6 +23,7 @@ const emit = defineEmits<{
 }>();
 
 const openMenu = ref<string | null>(null);
+const aboutOpen = ref(false);
 
 function toggleMenu(name: string) {
   openMenu.value = openMenu.value === name ? null : name;
@@ -32,66 +33,32 @@ function closeMenus() {
   openMenu.value = null;
 }
 
-// --- Action wrappers --------------------------------------------------------
+const actions = {
+  saveDraft: () => emit("saveDraft"),
+  send: () => emit("send"),
+  closeWindow: () => emit("closeWindow"),
+  attach: () => emit("attach"),
+  toggleCc: () => emit("toggleCc"),
+  toggleBcc: () => emit("toggleBcc"),
+  about: () => (aboutOpen.value = true),
+};
 
-function onSaveDraft() {
+function runAction(action: keyof typeof actions) {
   closeMenus();
-  emit("saveDraft");
+  actions[action]();
 }
 
-function onSend() {
-  closeMenus();
-  emit("send");
-}
-
-function onCloseWindow() {
-  closeMenus();
-  emit("closeWindow");
-}
-
-function onAttach() {
-  closeMenus();
-  emit("attach");
-}
-
-function onToggleCc() {
-  closeMenus();
-  emit("toggleCc");
-}
-
-function onToggleBcc() {
-  closeMenus();
-  emit("toggleBcc");
-}
-
-/**
- * Edit menu items invoke document.execCommand directly because the menu is
- * effectively a clickable surface for the same operations the OS exposes via
- * the standard editing shortcuts. The keyboard shortcuts are intentionally
- * NOT registered with our dispatch table — the browser (or the WebKitGTK
- * workaround in ComposeView) handles them so platform behaviour stays
- * intact when focus is inside a text input.
- */
+// Keep Edit shortcuts browser-managed while focus is inside a text field.
 function execEdit(cmd: "undo" | "redo" | "cut" | "copy" | "paste" | "selectAll") {
   closeMenus();
   document.execCommand(cmd);
 }
 
-const aboutOpen = ref(false);
-
-function onAbout() {
-  closeMenus();
-  aboutOpen.value = true;
-}
-
-// --- Shortcut definitions ---------------------------------------------------
-
-const sc = {
+const shortcuts = {
   saveDraft: { key: "s", ctrl: true } satisfies ShortcutDef,
   send: { key: "Enter", ctrl: true } satisfies ShortcutDef,
   closeWindow: { key: "Escape" } satisfies ShortcutDef,
   attach: { key: "a", ctrl: true, shift: true } satisfies ShortcutDef,
-  // Edit shortcuts are display-only — see execEdit() comment.
   undo: { key: "z", ctrl: true } satisfies ShortcutDef,
   redo: { key: "z", ctrl: true, shift: true } satisfies ShortcutDef,
   cut: { key: "x", ctrl: true } satisfies ShortcutDef,
@@ -101,19 +68,14 @@ const sc = {
 } as const;
 
 const bindings: readonly ShortcutBinding[] = [
-  { ...sc.saveDraft, handler: onSaveDraft },
-  { ...sc.send, handler: onSend },
-  { ...sc.closeWindow, handler: onCloseWindow },
-  { ...sc.attach, handler: onAttach },
+  { ...shortcuts.saveDraft, handler: () => runAction("saveDraft") },
+  { ...shortcuts.send, handler: () => runAction("send") },
+  { ...shortcuts.closeWindow, handler: () => runAction("closeWindow") },
+  { ...shortcuts.attach, handler: () => runAction("attach") },
 ];
 
 function onKeyDown(event: KeyboardEvent) {
-  // Compose-window shortcuts intentionally fire even with focus in the
-  // compose textarea so Ctrl+S / Ctrl+Return / Esc work while writing.
-  // The Edit shortcuts (Z/X/C/V/A) are NOT in this dispatch table; they
-  // fall through to the browser / WebKitGTK workaround.
-  // The AboutDialog's own Esc handler stops propagation when the modal
-  // is open, so we don't need a guard here.
+  // Compose actions remain active in text fields; Edit shortcuts are not bound.
   dispatch(event, bindings);
 }
 
@@ -123,105 +85,97 @@ onUnmounted(() => window.removeEventListener("keydown", onKeyDown));
 
 <template>
   <div class="menu-bar" @mouseleave="closeMenus" data-testid="compose-menu-bar">
-    <!-- File -->
     <div class="menu-item" @click.stop="toggleMenu('file')">
       <span class="menu-label">File</span>
       <div v-if="openMenu === 'file'" class="menu-dropdown" @click.stop data-testid="compose-menu-file-dropdown">
-        <button class="menu-action" data-testid="compose-menu-save-draft" @click="onSaveDraft">
+        <button class="menu-action" data-testid="compose-menu-save-draft" @click="runAction('saveDraft')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Save Draft</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.saveDraft) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.saveDraft) }}</span>
         </button>
-        <button class="menu-action" data-testid="compose-menu-send" @click="onSend">
+        <button class="menu-action" data-testid="compose-menu-send" @click="runAction('send')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Send</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.send) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.send) }}</span>
         </button>
         <div class="menu-separator"></div>
-        <button class="menu-action" data-testid="compose-menu-close-window" @click="onCloseWindow">
+        <button class="menu-action" data-testid="compose-menu-close-window" @click="runAction('closeWindow')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Close Window</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.closeWindow) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.closeWindow) }}</span>
         </button>
       </div>
     </div>
 
-    <!-- Edit -->
     <div class="menu-item" @click.stop="toggleMenu('edit')">
       <span class="menu-label">Edit</span>
       <div v-if="openMenu === 'edit'" class="menu-dropdown" @click.stop data-testid="compose-menu-edit-dropdown">
         <button class="menu-action" data-testid="compose-menu-undo" @click="execEdit('undo')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Undo</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.undo) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.undo) }}</span>
         </button>
         <button class="menu-action" data-testid="compose-menu-redo" @click="execEdit('redo')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Redo</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.redo) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.redo) }}</span>
         </button>
         <div class="menu-separator"></div>
         <button class="menu-action" data-testid="compose-menu-cut" @click="execEdit('cut')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Cut</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.cut) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.cut) }}</span>
         </button>
         <button class="menu-action" data-testid="compose-menu-copy" @click="execEdit('copy')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Copy</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.copy) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.copy) }}</span>
         </button>
         <button class="menu-action" data-testid="compose-menu-paste" @click="execEdit('paste')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Paste</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.paste) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.paste) }}</span>
         </button>
         <div class="menu-separator"></div>
         <button class="menu-action" data-testid="compose-menu-select-all" @click="execEdit('selectAll')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Select All</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.selectAll) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.selectAll) }}</span>
         </button>
       </div>
     </div>
 
-    <!-- View -->
     <div class="menu-item" @click.stop="toggleMenu('view')">
       <span class="menu-label">View</span>
       <div v-if="openMenu === 'view'" class="menu-dropdown" @click.stop data-testid="compose-menu-view-dropdown">
-        <button class="menu-action" data-testid="compose-menu-show-cc" @click="onToggleCc">
-          <span class="action-prefix">{{ props.showCc ? '\u2713' : '\u00A0' }}</span>
+        <button class="menu-action" data-testid="compose-menu-show-cc" @click="runAction('toggleCc')">
+          <span class="action-prefix">{{ showCc ? '\u2713' : '\u00A0' }}</span>
           <span class="action-label">Show Cc</span>
-          <span class="action-shortcut"></span>
         </button>
-        <button class="menu-action" data-testid="compose-menu-show-bcc" @click="onToggleBcc">
-          <span class="action-prefix">{{ props.showBcc ? '\u2713' : '\u00A0' }}</span>
+        <button class="menu-action" data-testid="compose-menu-show-bcc" @click="runAction('toggleBcc')">
+          <span class="action-prefix">{{ showBcc ? '\u2713' : '\u00A0' }}</span>
           <span class="action-label">Show Bcc</span>
-          <span class="action-shortcut"></span>
         </button>
       </div>
     </div>
 
-    <!-- Options -->
     <div class="menu-item" @click.stop="toggleMenu('options')">
       <span class="menu-label">Options</span>
       <div v-if="openMenu === 'options'" class="menu-dropdown" @click.stop data-testid="compose-menu-options-dropdown">
-        <button class="menu-action" data-testid="compose-menu-attach" @click="onAttach">
+        <button class="menu-action" data-testid="compose-menu-attach" @click="runAction('attach')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">Attach File&hellip;</span>
-          <span class="action-shortcut">{{ formatShortcut(sc.attach) }}</span>
+          <span class="action-shortcut">{{ formatShortcut(shortcuts.attach) }}</span>
         </button>
       </div>
     </div>
 
-    <!-- Help -->
     <div class="menu-item" @click.stop="toggleMenu('help')">
       <span class="menu-label">Help</span>
       <div v-if="openMenu === 'help'" class="menu-dropdown" @click.stop data-testid="compose-menu-help-dropdown">
-        <button class="menu-action" data-testid="compose-menu-about" @click="onAbout">
+        <button class="menu-action" data-testid="compose-menu-about" @click="runAction('about')">
           <span class="action-prefix">&#160;</span>
           <span class="action-label">About Chithi&hellip;</span>
-          <span class="action-shortcut"></span>
         </button>
       </div>
     </div>
