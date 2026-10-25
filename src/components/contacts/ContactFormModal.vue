@@ -1,18 +1,5 @@
 <script setup lang="ts">
-/// New/Edit contact modal, extracted from ContactsView (#166) and
-/// shared by the desktop and mobile layouts (`compact` renders the
-/// mobile field subset: no middle name, label selects, job title or
-/// notes, so mobile doesn't silently gain fields). Owns the draft
-/// fields and the create/update API calls; the parent reacts to the
-/// `saved` emit (reload the visible list, re-point the selection).
-///
-/// `openNew(defaultBookId, prefill?)` / `openEdit(contact)` are the
-/// imperative handles. The `prefill` seam exists for MessageReader's
-/// add-from-address flow (#166 C17). On edit, the contact passed to
-/// `openEdit` is snapshotted so the update spread preserves identity
-/// fields (id, uid, remote_id, etag, vcard_data) without reading the
-/// parent's selection at save time.
-import { ref } from "vue";
+import { ref, shallowRef } from "vue";
 import { useAccountsStore } from "@/stores/accounts";
 import type { Contact, ContactBook } from "@/lib/types";
 import * as api from "@/lib/tauri";
@@ -31,7 +18,7 @@ const PHONE_LABEL_OPTIONS = [
   { value: "home", label: "Home" },
 ];
 
-const props = defineProps<{
+defineProps<{
   books: ContactBook[];
   compact?: boolean;
 }>();
@@ -49,15 +36,13 @@ const formOrg = ref("");
 const formTitle = ref("");
 const formNotes = ref("");
 const formBookId = ref("");
-const editingContactId = ref<string | null>(null);
-/// Snapshot of the contact being edited — the update call spreads it
-/// so identity fields survive.
-let editingContact: Contact | null = null;
+// Retain the edited record so identity fields survive the update spread.
+const editingContact = shallowRef<Contact | null>(null);
 const saving = ref(false);
 const error = ref<string | null>(null);
 
 function getAccountName(accountId: string): string {
-  return accountsStore.accounts.find((a) => a.id === accountId)?.display_name ?? "";
+  return accountsStore.accounts.find((account) => account.id === accountId)?.display_name ?? "";
 }
 
 function splitDisplayName(name: string): { first: string; middle: string; last: string } {
@@ -68,16 +53,17 @@ function splitDisplayName(name: string): { first: string; middle: string; last: 
 }
 
 function buildDisplayName(): string {
-  const parts = [formFirstName.value.trim(), formMiddleName.value.trim(), formLastName.value.trim()].filter(Boolean);
-  return parts.join(" ");
+  return [formFirstName.value, formMiddleName.value, formLastName.value]
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .join(" ");
 }
 
 function openNew(
   defaultBookId: string,
   prefill?: { firstName?: string; middleName?: string; lastName?: string; email?: string },
 ) {
-  editingContactId.value = null;
-  editingContact = null;
+  editingContact.value = null;
   formFirstName.value = prefill?.firstName ?? "";
   formMiddleName.value = prefill?.middleName ?? "";
   formLastName.value = prefill?.lastName ?? "";
@@ -92,8 +78,7 @@ function openNew(
 }
 
 function openEdit(contact: Contact) {
-  editingContactId.value = contact.id;
-  editingContact = contact;
+  editingContact.value = contact;
   const nameParts = splitDisplayName(contact.display_name);
   formFirstName.value = nameParts.first;
   formMiddleName.value = nameParts.middle;
@@ -122,38 +107,27 @@ async function saveContact() {
   saving.value = true;
   error.value = null;
 
-  const displayName = buildDisplayName();
-  const emailsFiltered = formEmails.value.filter((e) => e.email.trim());
-  const phonesFiltered = formPhones.value.filter((p) => p.number.trim());
+  const editedContact = editingContact.value;
+  const fields = {
+    book_id: formBookId.value,
+    display_name: buildDisplayName(),
+    emails_json: JSON.stringify(formEmails.value.filter((email) => email.email.trim())),
+    phones_json: JSON.stringify(formPhones.value.filter((phone) => phone.number.trim())),
+    organization: formOrg.value || null,
+    title: formTitle.value || null,
+    notes: formNotes.value || null,
+  };
 
   try {
-    if (editingContactId.value && editingContact) {
-      await api.updateContact({
-        ...editingContact,
-        display_name: displayName,
-        emails_json: JSON.stringify(emailsFiltered),
-        phones_json: JSON.stringify(phonesFiltered),
-        organization: formOrg.value || null,
-        title: formTitle.value || null,
-        notes: formNotes.value || null,
-        book_id: formBookId.value,
-      });
+    if (editedContact) {
+      await api.updateContact({ ...editedContact, ...fields });
     } else {
-      await api.createContact({
-        book_id: formBookId.value,
-        display_name: displayName,
-        emails_json: JSON.stringify(emailsFiltered),
-        phones_json: JSON.stringify(phonesFiltered),
-        addresses_json: "[]",
-        organization: formOrg.value || null,
-        title: formTitle.value || null,
-        notes: formNotes.value || null,
-      });
+      await api.createContact({ ...fields, addresses_json: "[]" });
     }
     showForm.value = false;
-    emit("saved", editingContactId.value);
-  } catch (e) {
-    error.value = String(e);
+    emit("saved", editedContact?.id ?? null);
+  } catch (cause) {
+    error.value = String(cause);
   } finally {
     saving.value = false;
   }
@@ -165,7 +139,7 @@ async function saveContact() {
     <div v-if="showForm" class="modal-overlay" @click.self="showForm = false">
       <div class="modal">
         <div class="modal-header">
-          <h3>{{ editingContactId ? "Edit Contact" : "New Contact" }}</h3>
+          <h3>{{ editingContact ? "Edit Contact" : "New Contact" }}</h3>
           <button class="modal-close" @click="showForm = false">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
           </button>
@@ -177,7 +151,7 @@ async function saveContact() {
             <label>Contact Book</label>
             <Select
               v-model="formBookId"
-              :options="props.books.map(b => ({ value: b.id, label: `${b.name} (${getAccountName(b.account_id)})` }))"
+              :options="books.map(book => ({ value: book.id, label: `${book.name} (${getAccountName(book.account_id)})` }))"
             />
           </div>
 
@@ -234,7 +208,7 @@ async function saveContact() {
         <div class="modal-footer">
           <button class="btn-cancel" @click="showForm = false">Cancel</button>
           <button class="btn-save" :disabled="saving" data-testid="contact-save-btn" @click="saveContact">
-            {{ saving ? "Saving..." : editingContactId ? "Save" : "Add Contact" }}
+            {{ saving ? "Saving..." : editingContact ? "Save" : "Add Contact" }}
           </button>
         </div>
       </div>
@@ -243,13 +217,10 @@ async function saveContact() {
 </template>
 
 <style scoped>
-/* Contacts-flavored modal chrome, carried per-component so the look
-   stays byte-identical to the pre-split view (it differs from the
-   settings ModalShell chrome). */
 .modal-overlay {
-  position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+  position: fixed; inset: 0;
   background: rgba(0, 0, 0, 0.6);
-  display: flex; align-items: center; justify-content: center;
+  display: grid; place-items: center;
   z-index: 1000;
 }
 
@@ -271,7 +242,7 @@ async function saveContact() {
 
 .modal-close {
   width: 32px; height: 32px; border-radius: 4px;
-  display: flex; align-items: center; justify-content: center;
+  display: grid; place-items: center;
   color: var(--color-text-muted);
 }
 .modal-close:hover { background: var(--color-bg-hover); }
@@ -289,15 +260,15 @@ async function saveContact() {
   color: var(--color-danger-text); border-radius: 6px; margin-bottom: 16px; font-size: 12px;
 }
 
-.form-group { margin-bottom: 16px; }
-.form-group label { display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500; color: var(--color-text-secondary); }
 .form-group {
+  margin-bottom: 16px;
   --input-height: 36px;
   --input-padding: 0 12px;
   --input-border: 0.8px solid var(--color-border);
   --input-bg: var(--color-bg-secondary);
   --input-font-size: 16px;
 }
+.form-group label { display: block; margin-bottom: 4px; font-size: 14px; font-weight: 500; color: var(--color-text-secondary); }
 
 .form-group input, .form-group textarea {
   width: 100%; height: 36px; padding: 0 12px;
@@ -318,7 +289,7 @@ async function saveContact() {
 
 .rm-btn {
   width: 36px; height: 36px; border-radius: 4px; font-size: 18px;
-  color: var(--color-text-muted); display: flex; align-items: center; justify-content: center;
+  color: var(--color-text-muted); display: grid; place-items: center;
 }
 .rm-btn:hover { background: rgba(251,44,54,0.08); color: var(--color-danger-text); }
 
