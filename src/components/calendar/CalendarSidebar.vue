@@ -21,8 +21,10 @@ const calendarStore = useCalendarStore();
 const accountsStore = useAccountsStore();
 
 function getAccountLabel(accountId: string): string {
-  const acc = accountsStore.accounts.find((a) => a.id === accountId);
-  return acc ? acc.email : "";
+  const account = accountsStore.accounts.find(
+    (candidate) => candidate.id === accountId,
+  );
+  return account?.email ?? "";
 }
 
 const contextMenu = ref<{ x: number; y: number; calendarId: string; accountId: string } | null>(null);
@@ -32,10 +34,7 @@ function getCalendarColor(color: string): string {
   return color || "#4285f4";
 }
 
-// Time the menu was opened. Used to suppress the trailing click that
-// some WebKit builds synthesise on right-mouse-release; without this
-// guard the menu would flash open and immediately close before the
-// user could interact with it.
+// Suppress WebKit's synthetic click after a right-button release.
 let menuOpenedAt = 0;
 
 function onContextMenu(event: MouseEvent, calId: string, accountId: string) {
@@ -45,17 +44,9 @@ function onContextMenu(event: MouseEvent, calId: string, accountId: string) {
   contextMenu.value = { x: event.clientX, y: event.clientY, calendarId: calId, accountId };
 }
 
-// Toggle visibility on left-click of the row. We use a plain <div>
-// (not <label>) because WebKitGTK's <label> autoactivates the wrapped
-// <input> on *any* mouse-button press, which means right-clicking
-// flips the checkbox before the contextmenu handler can run. With a
-// <div>, the click event itself only fires for the primary button,
-// and we additionally guard on `event.button` for safety.
+// A div avoids WebKitGTK labels toggling checkboxes on right-click.
 function onLabelClick(event: MouseEvent, calId: string) {
   if (event.button !== 0) return;
-  // Direct clicks on the checkbox are handled by its own @change;
-  // @click.stop on the input prevents this branch from running, but
-  // keep the tag check as a belt-and-braces fallback.
   const target = event.target as HTMLElement | null;
   if (target?.tagName === "INPUT") return;
   calendarStore.toggleCalendarVisibility(calId);
@@ -65,18 +56,12 @@ function closeContextMenu() {
   contextMenu.value = null;
 }
 
-// Close the menu on any LEFT-button click that lands outside the
-// teleported menu itself. Listener is attached permanently (in
-// onMounted) and short-circuits when the menu isn't open — that way
-// there's no watch / microtask race between setting `contextMenu`
-// and the listener actually existing.
-function onDocClickForMenu(e: MouseEvent) {
+// A permanent listener avoids racing the teleported menu mount.
+function onDocClickForMenu(event: MouseEvent) {
   if (!contextMenu.value) return;
-  if (e.button !== 0) return;
-  // 250ms guard against the right-click → synthesised-click sequence
-  // some WebKitGTK builds produce.
+  if (event.button !== 0) return;
   if (performance.now() - menuOpenedAt < 250) return;
-  const target = e.target as HTMLElement | null;
+  const target = event.target as HTMLElement | null;
   if (target?.closest(".cal-context-menu")) return;
   closeContextMenu();
 }
@@ -107,18 +92,18 @@ function onCalendarItemLeave(calId: string) {
 
 function onCalendarItemDrop(cal: Calendar) {
   if (!canDrop.value || !dragCalendarEvent.value) return;
-  const ev = dragCalendarEvent.value;
-  if (ev.calendar_id === cal.id) {
+  const event = dragCalendarEvent.value;
+  if (event.calendar_id === cal.id) {
     dropTargetCalendarId.value = null;
     return;
   }
   dropTargetCalendarId.value = null;
   emit("calendarDrop", {
-    eventId: ev.id,
+    eventId: event.id,
     targetCalendarId: cal.id,
     targetAccountId: cal.account_id,
-    attendeesJson: ev.attendees_json,
-    organizerEmail: ev.organizer_email,
+    attendeesJson: event.attendees_json,
+    organizerEmail: event.organizer_email,
   });
 }
 
@@ -132,8 +117,8 @@ async function syncThisCalendar() {
     await api.syncCalendars(accountId);
     await calendarStore.fetchCalendars();
     await calendarStore.fetchEvents();
-  } catch (e) {
-    console.error("Calendar sync failed:", e);
+  } catch (error) {
+    console.error("Calendar sync failed:", error);
   } finally {
     syncing.value = null;
   }
@@ -143,21 +128,11 @@ const renaming = ref<{ calendar: Calendar; value: string } | null>(null);
 const renameSaving = ref(false);
 const renameError = ref<string | null>(null);
 
-// Color-picker dialog state (#132). Mirrors the rename-dialog
-// shape: a snapshot of the calendar being edited plus a draft
-// `value` (the picked hex) and saving / error refs the modal binds
-// to. Cleared on cancel + on a successful save.
 const recoloring = ref<{ calendar: Calendar; value: string } | null>(null);
 const recolorSaving = ref(false);
 const recolorError = ref<string | null>(null);
 
-// Curated palette mirrors `random_calendar_color()` in
-// commands/calendar.rs so freshly-synced calendars and
-// user-picked colors come from the same set. If the user's
-// current color isn't in the palette (e.g. a server-supplied
-// custom hex) the picker still highlights it via the
-// `current === value` check below; the dialog also accepts a
-// freeform input.
+// Keep the palette aligned with backend-generated calendar colors.
 const PALETTE: { hex: string; name: string }[] = [
   { hex: "#4285f4", name: "Blue" },
   { hex: "#0b8043", name: "Green" },
@@ -187,11 +162,7 @@ function cancelRecolor() {
   recolorError.value = null;
 }
 
-/// Match either `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa`. Anything
-/// else is rejected before we hit the backend so we can't end up
-/// persisting a string the server will choke on (Graph returned an
-/// ISE on bogus inputs, CalDAV PROPPATCH'd a literal "blueish" into
-/// the calendar color).
+// Accept CSS hex forms supported by calendar backends.
 const HEX_COLOR_RE = /^#(?:[0-9a-f]{3,4}|[0-9a-f]{6}|[0-9a-f]{8})$/i;
 
 async function confirmRecolor() {
@@ -213,21 +184,18 @@ async function confirmRecolor() {
       recoloring.value.calendar.name,
       newColor,
     );
-  } catch (e) {
-    recolorError.value = e instanceof Error ? e.message : String(e);
+  } catch (error) {
+    recolorError.value = error instanceof Error ? error.message : String(error);
     recolorSaving.value = false;
     return;
   }
-  // Close the modal as soon as the backend returns — fetchCalendars
-  // can be slow when one account's listCalendars takes its time, and
-  // we don't want the dialog to sit there while the sidebar refreshes
-  // in the background.
+  // Close before the potentially slow background refresh.
   recoloring.value = null;
   recolorSaving.value = false;
-  showToast(`Color updated`, "success");
-  calendarStore
+  showToast("Color updated", "success");
+  void calendarStore
     .fetchCalendars()
-    .catch((e) => console.error("post-recolor refresh failed:", e));
+    .catch((error) => console.error("post-recolor refresh failed:", error));
 }
 
 function startRename() {
@@ -264,9 +232,8 @@ async function confirmRename() {
     await calendarStore.fetchCalendars();
     showToast(`Renamed to "${newName}"`, "success");
     renaming.value = null;
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    renameError.value = msg;
+  } catch (error) {
+    renameError.value = error instanceof Error ? error.message : String(error);
   } finally {
     renameSaving.value = false;
   }
@@ -284,9 +251,9 @@ async function unsubscribeThisCalendar() {
   try {
     await calendarStore.unsubscribeCalendar(calendarId);
     showToast(`Unsubscribed from "${calName}"`, "success");
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    showToast(`Failed to unsubscribe: ${msg}`, "error", 5000);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    showToast(`Failed to unsubscribe: ${message}`, "error", 5000);
   }
 }
 </script>
@@ -338,7 +305,6 @@ async function unsubscribeThisCalendar() {
       </div>
     </div>
 
-    <!-- Right-click context menu -->
     <Teleport to="body">
       <div
         v-if="contextMenu"
@@ -352,7 +318,6 @@ async function unsubscribeThisCalendar() {
       </div>
     </Teleport>
 
-    <!-- Rename modal -->
     <Teleport to="body">
       <div
         v-if="renaming"
@@ -400,7 +365,6 @@ async function unsubscribeThisCalendar() {
       </div>
     </Teleport>
 
-    <!-- Color picker (#132) -->
     <Teleport to="body">
       <div
         v-if="recoloring"
@@ -474,9 +438,6 @@ async function unsubscribeThisCalendar() {
   background: var(--color-bg-secondary);
 }
 
-/* The sidebar heading is 48px and full-width (no horizontal padding
-   from the parent), matching the right-pane toolbar. Items below get
-   their own padding via .calendar-list. */
 .calendar-list {
   flex: 1;
   overflow-y: auto;
@@ -639,7 +600,6 @@ async function unsubscribeThisCalendar() {
   border-color: var(--color-accent);
 }
 
-/* Color-picker (#132) */
 .color-swatches {
   display: grid;
   grid-template-columns: repeat(5, 1fr);
