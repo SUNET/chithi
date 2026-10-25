@@ -1,79 +1,55 @@
 import { invoke } from "@tauri-apps/api/core";
-import type {
-  Account,
-  AccountConfig,
-  AutoconfigResult,
-  Folder,
-  LastView,
-  MessagePage,
-  MessageBody,
-  QuickFilter,
-  SearchQuery,
-  SearchHit,
-} from "./types";
+import type * as Types from "./types";
 
-export async function listAccounts(): Promise<Account[]> {
+export function listAccounts(): Promise<Types.Account[]> {
   return invoke("list_accounts");
 }
 
-/// The account/folder the user was last viewing (#191), read once at
-/// startup by the accounts/folders stores to restore that view.
-export async function getLastView(): Promise<LastView> {
+export function getLastView(): Promise<Types.LastView> {
   return invoke("get_last_view");
 }
 
-/// Persist the account/folder the user is currently viewing (#191).
-/// Called debounced, so callers should let rejections just log rather
-/// than surface an error to the user.
-export async function saveLastView(
+export function saveLastView(
   accountId: string,
   folderPath: string,
 ): Promise<void> {
   return invoke("save_last_view", { accountId, folderPath });
 }
 
-export async function addAccount(config: AccountConfig): Promise<string> {
+export function addAccount(config: Types.AccountConfig): Promise<string> {
   return invoke("add_account", { config });
 }
 
-export async function getAccountConfig(
+export function getAccountConfig(
   accountId: string,
-): Promise<import("./types").AccountConfig> {
+): Promise<Types.AccountConfig> {
   return invoke("get_account_config", { accountId });
 }
 
-export async function updateAccount(
+export function updateAccount(
   accountId: string,
-  config: import("./types").AccountConfig,
+  config: Types.AccountConfig,
 ): Promise<void> {
   return invoke("update_account", { accountId, config });
 }
 
-export async function deleteAccount(accountId: string): Promise<void> {
+export function deleteAccount(accountId: string): Promise<void> {
   return invoke("delete_account", { accountId });
 }
 
-export async function abandonZoomAccount(
+export function abandonZoomAccount(
   accountId: string,
   confirmation: string,
 ): Promise<void> {
   return invoke("abandon_zoom_account", { accountId, confirmation });
 }
 
-/// Thunderbird-style mail-server discovery for the IMAP tab
-/// (Mozilla ISP DB / provider autoconfig / .well-known / MX). No
-/// CalDAV / CardDAV probing — those live on their own dedicated
-/// account types now. Empty fields = not found.
-///
-/// `imapHostHint` / `smtpHostHint` are the host values already typed
-/// in the form. When autoconfig has nothing to say for that service,
-/// the backend TCP-probes the hint's standard ports so the user can
-/// have the port + TLS flag filled in for a host they already know.
-export async function discoverMailServers(
+/** Probes provided IMAP/SMTP host hints when automatic discovery has no result. */
+export function discoverMailServers(
   email: string,
   imapHostHint?: string,
   smtpHostHint?: string,
-): Promise<AutoconfigResult> {
+): Promise<Types.AutoconfigResult> {
   return invoke("discover_mail_servers", {
     email,
     imapHostHint: imapHostHint || null,
@@ -81,19 +57,19 @@ export async function discoverMailServers(
   });
 }
 
-export async function listFolders(accountId: string): Promise<Folder[]> {
+export function listFolders(accountId: string): Promise<Types.Folder[]> {
   return invoke("list_folders", { accountId });
 }
 
-export async function getMessages(
+export function getMessages(
   accountId: string,
   folderPath: string,
   page: number,
   perPage: number,
   sortColumn?: string,
   sortAsc?: boolean,
-  filter?: QuickFilter,
-): Promise<MessagePage> {
+  filter?: Types.QuickFilter,
+): Promise<Types.MessagePage> {
   return invoke("get_messages", {
     accountId,
     folderPath,
@@ -105,49 +81,49 @@ export async function getMessages(
   });
 }
 
-export async function getMessageBody(
+export function getMessageBody(
   accountId: string,
   messageId: string,
-): Promise<MessageBody> {
+): Promise<Types.MessageBody> {
   return invoke("get_message_body", { accountId, messageId });
 }
 
-export async function searchMessagesServer(
+export function searchMessagesServer(
   accountId: string,
-  query: SearchQuery,
-): Promise<SearchHit[]> {
+  query: Types.SearchQuery,
+): Promise<Types.SearchHit[]> {
   return invoke("search_messages_server", { accountId, query });
 }
 
-export async function importSearchHit(
+export function importSearchHit(
   accountId: string,
-  hit: SearchHit,
+  hit: Types.SearchHit,
 ): Promise<string> {
   return invoke("import_search_hit", { accountId, hit });
 }
 
-export async function getMessageHtmlWithImages(
+export function getMessageHtmlWithImages(
   accountId: string,
   messageId: string,
 ): Promise<string> {
   return invoke("get_message_html_with_images", { accountId, messageId });
 }
 
-export async function createFolder(
+export function createFolder(
   accountId: string,
   folderPath: string,
 ): Promise<void> {
   return invoke("create_folder", { accountId, folderPath });
 }
 
-export async function deleteFolder(
+export function deleteFolder(
   accountId: string,
   folderPath: string,
 ): Promise<void> {
   return invoke("delete_folder", { accountId, folderPath });
 }
 
-export async function saveAttachment(
+export function saveAttachment(
   accountId: string,
   messageId: string,
   attachmentIndex: number,
@@ -161,7 +137,7 @@ export async function saveAttachment(
   });
 }
 
-export async function saveMessageAsEml(
+export function saveMessageAsEml(
   accountId: string,
   messageId: string,
   suggestedFilename: string,
@@ -173,14 +149,14 @@ export async function saveMessageAsEml(
   });
 }
 
-export async function syncFolder(
+export function syncFolder(
   accountId: string,
   folderPath: string,
 ): Promise<number> {
   return invoke("sync_folder", { accountId, folderPath });
 }
 
-export async function triggerSync(
+export function triggerSync(
   accountId: string,
   currentFolder?: string,
 ): Promise<void> {
@@ -190,46 +166,35 @@ export async function triggerSync(
   });
 }
 
-export async function prefetchBodies(accountId: string): Promise<number> {
+export function prefetchBodies(accountId: string): Promise<number> {
   return invoke("prefetch_bodies", { accountId });
 }
 
-export async function sendMessage(
+export function sendMessage(
   accountId: string,
-  message: import("./types").ComposeMessage,
+  message: Types.ComposeMessage,
 ): Promise<void> {
   return invoke("send_message", { accountId, message });
 }
 
-export async function saveDraft(
+export function saveDraft(
   accountId: string,
-  message: import("./types").ComposeMessage,
-): Promise<import("./types").DraftSaveOutcome> {
+  message: Types.ComposeMessage,
+): Promise<Types.DraftSaveOutcome> {
   return invoke("save_draft", { accountId, message });
 }
 
-/**
- * Open a backend-owned native file picker and register the chosen files.
- * The renderer receives opaque tokens, never the raw paths, so a
- * compromised renderer cannot ask the backend to read arbitrary files
- * when composing a message.
- */
-export async function pickAttachments(): Promise<
-  Array<{ token: string; name: string }>
-> {
+/** Returns opaque attachment tokens so renderer code never receives file paths. */
+export function pickAttachments(): Promise<Array<{ token: string; name: string }>> {
   return invoke("pick_attachments");
 }
 
-/**
- * Release a previously-issued attachment token so the backend forgets
- * the path. Called when the user removes an attachment chip or when
- * the compose window unmounts without sending.
- */
-export async function releaseAttachment(token: string): Promise<void> {
+/** Releases the backend path associated with an attachment token. */
+export function releaseAttachment(token: string): Promise<void> {
   return invoke("release_attachment", { token });
 }
 
-export async function moveMessages(
+export function moveMessages(
   accountId: string,
   messageIds: string[],
   targetFolder: string,
@@ -237,7 +202,7 @@ export async function moveMessages(
   return invoke("move_messages", { accountId, messageIds, targetFolder });
 }
 
-export async function moveMessagesCrossAccount(
+export function moveMessagesCrossAccount(
   sourceAccountId: string,
   messageIds: string[],
   targetAccountId: string,
@@ -251,14 +216,14 @@ export async function moveMessagesCrossAccount(
   });
 }
 
-export async function deleteMessages(
+export function deleteMessages(
   accountId: string,
   messageIds: string[],
 ): Promise<void> {
   return invoke("delete_messages", { accountId, messageIds });
 }
 
-export async function setMessageFlags(
+export function setMessageFlags(
   accountId: string,
   messageIds: string[],
   flags: string[],
@@ -267,7 +232,7 @@ export async function setMessageFlags(
   return invoke("set_message_flags", { accountId, messageIds, flags, add });
 }
 
-export async function copyMessages(
+export function copyMessages(
   accountId: string,
   messageIds: string[],
   targetFolder: string,
@@ -275,20 +240,19 @@ export async function copyMessages(
   return invoke("copy_messages", { accountId, messageIds, targetFolder });
 }
 
-export async function markAccountRead(accountId: string): Promise<number> {
+export function markAccountRead(accountId: string): Promise<number> {
   return invoke("mark_account_read", { accountId });
 }
 
-// Threading
-export async function getThreadedMessages(
+export function getThreadedMessages(
   accountId: string,
   folderPath: string,
   page: number,
   perPage: number,
   sortColumn?: string,
   sortAsc?: boolean,
-  filter?: QuickFilter,
-): Promise<import("./types").ThreadedPage> {
+  filter?: Types.QuickFilter,
+): Promise<Types.ThreadedPage> {
   return invoke("get_threaded_messages", {
     accountId,
     folderPath,
@@ -300,45 +264,38 @@ export async function getThreadedMessages(
   });
 }
 
-export async function getThreadMessages(
+export function getThreadMessages(
   accountId: string,
   folderPath: string,
   threadId: string,
-): Promise<import("./types").MessageSummary[]> {
+): Promise<Types.MessageSummary[]> {
   return invoke("get_thread_messages", { accountId, folderPath, threadId });
 }
 
-export async function unthreadMessage(messageId: string): Promise<void> {
+export function unthreadMessage(messageId: string): Promise<void> {
   return invoke("unthread_message", { messageId });
 }
 
-// Calendar
-export async function listCalendars(
+export function listCalendars(
   accountId: string,
-): Promise<import("./types").Calendar[]> {
+): Promise<Types.Calendar[]> {
   return invoke("list_calendars", { accountId });
 }
 
-export async function listArchivedGraphCalendars(
+export function listArchivedGraphCalendars(
   accountId: string,
-): Promise<import("./types").ArchivedGraphCalendar[]> {
+): Promise<Types.ArchivedGraphCalendar[]> {
   return invoke("list_archived_graph_calendars", { accountId });
 }
 
-export async function acknowledgeArchivedGraphCalendar(
+export function acknowledgeArchivedGraphCalendar(
   accountId: string,
   calendarId: string,
 ): Promise<void> {
   return invoke("acknowledge_archived_graph_calendar", { accountId, calendarId });
 }
 
-export async function createCalendar(
-  calendar: { account_id: string; name: string; color: string; is_default: boolean },
-): Promise<string> {
-  return invoke("create_calendar", { calendar });
-}
-
-export async function updateCalendar(
+export function updateCalendar(
   calendarId: string,
   name: string,
   color: string,
@@ -346,37 +303,38 @@ export async function updateCalendar(
   return invoke("update_calendar", { calendarId, name, color });
 }
 
-export async function deleteCalendar(calendarId: string): Promise<void> {
-  return invoke("delete_calendar", { calendarId });
-}
-
-export async function getEvents(
+export function getEvents(
   accountId: string,
   start: string,
   end: string,
   calendarId?: string,
-): Promise<import("./types").CalendarEvent[]> {
-  return invoke("get_events", { accountId, start, end, calendarId: calendarId ?? null });
+): Promise<Types.CalendarEvent[]> {
+  return invoke("get_events", {
+    accountId,
+    start,
+    end,
+    calendarId: calendarId ?? null,
+  });
 }
 
-export async function getCalendarEvent(
+export function getCalendarEvent(
   eventId: string,
-): Promise<import("./types").CalendarEvent> {
+): Promise<Types.CalendarEvent> {
   return invoke("get_calendar_event", { eventId });
 }
 
-export async function listRoomSuggestions(
+export function listRoomSuggestions(
   accountId: string,
-): Promise<import("./types").RoomSuggestion[]> {
+): Promise<Types.RoomSuggestion[]> {
   return invoke("list_room_suggestions", { accountId });
 }
 
-export async function checkRoomAvailability(
+export function checkRoomAvailability(
   accountId: string,
   roomAddress: string,
   startTime: string,
   endTime: string,
-): Promise<import("./types").RoomAvailability> {
+): Promise<Types.RoomAvailability> {
   return invoke("check_room_availability", {
     accountId,
     roomAddress,
@@ -385,12 +343,12 @@ export async function checkRoomAvailability(
   });
 }
 
-export async function getParticipantSchedules(
+export function getParticipantSchedules(
   accountId: string,
   emails: string[],
   startTime: string,
   endTime: string,
-): Promise<import("./types").ParticipantSchedule[]> {
+): Promise<Types.ParticipantSchedule[]> {
   return invoke("get_participant_schedules", {
     accountId,
     emails,
@@ -399,36 +357,36 @@ export async function getParticipantSchedules(
   });
 }
 
-export async function createEvent(
-  event: import("./types").NewEventInput,
+export function createEvent(
+  event: Types.NewEventInput,
   operationId: string,
 ): Promise<string> {
   return invoke("create_event", { event, operationId });
 }
 
-export async function updateEvent(
+export function updateEvent(
   eventId: string,
-  event: Partial<import("./types").NewEventInput>,
+  event: Partial<Types.NewEventInput>,
 ): Promise<void> {
   return invoke("update_event", { eventId, event });
 }
 
-export async function readCalendarEventSet(
+export function readCalendarEventSet(
   eventId: string,
   start: string,
   end: string,
   limit = 200,
-): Promise<import("./types").CalendarEventSetView> {
+): Promise<Types.CalendarEventSetView> {
   return invoke("read_calendar_event_set", { eventId, start, end, limit });
 }
 
-export async function listCalendarOccurrences(
+export function listCalendarOccurrences(
   accountId: string,
   calendarId: string | null,
   start: string,
   end: string,
   limit = 2000,
-): Promise<import("./types").CalendarOccurrencePage> {
+): Promise<Types.CalendarOccurrencePage> {
   return invoke("list_calendar_occurrences", {
     accountId,
     calendarId,
@@ -438,25 +396,25 @@ export async function listCalendarOccurrences(
   });
 }
 
-export async function repairCalendarOccurrence(eventId: string): Promise<{
+export function repairCalendarOccurrence(eventId: string): Promise<{
   repaired: boolean;
   retry_after_seconds: number | null;
 }> {
   return invoke("repair_calendar_occurrence", { eventId });
 }
 
-export async function planCalendarAction(
-  input: import("./types").CalendarActionInput,
-): Promise<import("./types").CalendarActionPlan> {
+export function planCalendarAction(
+  input: Types.CalendarActionInput,
+): Promise<Types.CalendarActionPlan> {
   return invoke("plan_calendar_action", { input });
 }
 
-export async function planCalendarOccurrenceAction(
+export function planCalendarOccurrenceAction(
   eventId: string,
   originalStart: string,
-  expected: import("./types").CalendarOccurrenceFields,
-  edit: import("./types").CalendarEdit,
-): Promise<import("./types").CalendarActionPlan> {
+  expected: Types.CalendarOccurrenceFields,
+  edit: Types.CalendarEdit,
+): Promise<Types.CalendarActionPlan> {
   return invoke("plan_calendar_occurrence_action", {
     eventId,
     originalStart,
@@ -465,61 +423,63 @@ export async function planCalendarOccurrenceAction(
   });
 }
 
-export async function executeCalendarAction(
+export function executeCalendarAction(
   operationId: string,
-  confirmations: import("./types").CalendarConfirmations,
-): Promise<import("./types").CalendarActionResult> {
+  confirmations: Types.CalendarConfirmations,
+): Promise<Types.CalendarActionResult> {
   return invoke("execute_calendar_action", { operationId, confirmations });
 }
 
-export async function listPendingCalendarActions(
+export function listPendingCalendarActions(
   accountId: string,
-): Promise<import("./types").CalendarActionResult[]> {
+): Promise<Types.CalendarActionResult[]> {
   return invoke("list_pending_calendar_actions", { accountId });
 }
 
-export async function discardCalendarAction(operationId: string): Promise<void> {
+export function discardCalendarAction(operationId: string): Promise<void> {
   return invoke("discard_calendar_action", { operationId });
 }
 
-export async function deleteEvent(eventId: string): Promise<void> {
+export function deleteEvent(eventId: string): Promise<void> {
   return invoke("delete_event", { eventId });
 }
 
-export async function moveEventToCalendar(
+export function moveEventToCalendar(
   eventId: string,
   targetCalendarId: string,
   targetAccountId: string,
 ): Promise<string> {
   return invoke("move_event_to_calendar", {
-    eventId, targetCalendarId, targetAccountId,
+    eventId,
+    targetCalendarId,
+    targetAccountId,
   });
 }
 
-export async function unsubscribeCalendar(calendarId: string): Promise<void> {
+export function unsubscribeCalendar(calendarId: string): Promise<void> {
   return invoke("unsubscribe_calendar", { calendarId });
 }
 
-export async function syncCalendars(
+export function syncCalendars(
   accountId: string,
   forceFullSync?: boolean,
 ): Promise<void> {
   return invoke("sync_calendars", { accountId, forceFullSync });
 }
 
-export async function getEmailInvites(
+export function getEmailInvites(
   accountId: string,
   messageId: string,
-): Promise<import("./types").ParsedInvite[]> {
+): Promise<Types.ParsedInvite[]> {
   return invoke("get_email_invites", { accountId, messageId });
 }
 
-export async function previewCalendarAttachment(
+export function previewCalendarAttachment(
   sourceAccountId: string,
   messageId: string,
   attachmentIndex: number,
   calendarId: string,
-): Promise<import("./types").CalendarImportPreview[]> {
+): Promise<Types.CalendarImportPreview[]> {
   return invoke("preview_calendar_attachment", {
     sourceAccountId,
     messageId,
@@ -528,32 +488,30 @@ export async function previewCalendarAttachment(
   });
 }
 
-export async function listCalendarImportTargets(): Promise<
-  import("./types").Calendar[]
-> {
+export function listCalendarImportTargets(): Promise<Types.Calendar[]> {
   return invoke("list_calendar_import_targets");
 }
 
-export async function getDefaultImportCalendar(
+export function getDefaultImportCalendar(
   accountId: string,
 ): Promise<string | null> {
   return invoke("get_default_import_calendar", { accountId });
 }
 
-export async function setDefaultImportCalendar(
+export function setDefaultImportCalendar(
   accountId: string,
   calendarId: string | null,
 ): Promise<void> {
   return invoke("set_default_import_calendar", { accountId, calendarId });
 }
 
-export async function importCalendarAttachment(
+export function importCalendarAttachment(
   sourceAccountId: string,
   messageId: string,
   attachmentIndex: number,
   calendarId: string,
   selectedUids: string[],
-): Promise<import("./types").CalendarImportResult> {
+): Promise<Types.CalendarImportResult> {
   return invoke("import_calendar_attachment", {
     sourceAccountId,
     messageId,
@@ -563,14 +521,7 @@ export async function importCalendarAttachment(
   });
 }
 
-export async function getEventByUid(
-  accountId: string,
-  uid: string,
-): Promise<import("./types").CalendarEvent | null> {
-  return invoke("get_event_by_uid", { accountId, uid });
-}
-
-export async function sendInvites(
+export function sendInvites(
   accountId: string,
   eventId: string,
   attendeeEmails: string[],
@@ -578,63 +529,63 @@ export async function sendInvites(
   return invoke("send_invites", { accountId, eventId, attendeeEmails });
 }
 
-export async function notifyCalendarEvent(
+export function notifyCalendarEvent(
   eventId: string,
 ): Promise<void> {
   return invoke("notify_calendar_event", { eventId });
 }
 
-export async function processInviteReply(
+export function processInviteReply(
   accountId: string,
   messageId: string,
 ): Promise<void> {
   return invoke("process_invite_reply", { accountId, messageId });
 }
 
-export async function processCancelledInvite(
+export function processCancelledInvite(
   accountId: string,
   messageId: string,
 ): Promise<void> {
   return invoke("process_cancelled_invite", { accountId, messageId });
 }
 
-export async function getInviteStatus(
+export function getInviteStatus(
   accountId: string,
   inviteUid: string,
 ): Promise<string | null> {
   return invoke("get_invite_status", { accountId, inviteUid });
 }
 
-export async function respondToInvite(
+export function respondToInvite(
   accountId: string,
   messageId: string,
   inviteUid: string,
   response: string,
 ): Promise<void> {
-  return invoke("respond_to_invite", { accountId, messageId, inviteUid, response });
+  return invoke("respond_to_invite", {
+    accountId,
+    messageId,
+    inviteUid,
+    response,
+  });
 }
 
-/** List all calendar invites for an account (Invites view). */
-export async function listInvites(
+export function listInvites(
   accountId: string,
-): Promise<import("./types").Invite[]> {
+): Promise<Types.Invite[]> {
   return invoke("list_invites", { accountId });
 }
 
-/** Mark a stored invitation as handled locally without sending an RSVP. */
-export async function markInviteManaged(
+/** Marks an invitation as handled without sending an RSVP. */
+export function markInviteManaged(
   accountId: string,
   eventId: string,
 ): Promise<void> {
   return invoke("mark_invite_managed", { accountId, eventId });
 }
 
-/**
- * Change the RSVP for a stored calendar event. Unlike `respondToInvite`,
- * this needs no original invite email — the iTIP REPLY is rebuilt from the
- * persisted event. `response` is "accepted", "tentative", or "declined".
- */
-export async function respondToEvent(
+/** Rebuilds an iTIP RSVP from a persisted event instead of the original email. */
+export function respondToEvent(
   accountId: string,
   eventId: string,
   response: string,
@@ -642,50 +593,40 @@ export async function respondToEvent(
   return invoke("respond_to_event", { accountId, eventId, response });
 }
 
-// Filter rules
-export async function listFilters(
+export function listFilters(
   accountId?: string,
-): Promise<import("./types").FilterRule[]> {
+): Promise<Types.FilterRule[]> {
   return invoke("list_filters", { accountId: accountId ?? null });
 }
 
-export async function saveFilter(
-  rule: import("./types").FilterRule,
-): Promise<void> {
+export function saveFilter(rule: Types.FilterRule): Promise<void> {
   return invoke("save_filter", { rule });
 }
 
-export async function deleteFilter(filterId: string): Promise<void> {
+export function deleteFilter(filterId: string): Promise<void> {
   return invoke("delete_filter", { filterId });
 }
 
-export async function applyFiltersToFolder(
+export function applyFiltersToFolder(
   accountId: string,
   folderPath: string,
 ): Promise<number> {
   return invoke("apply_filters_to_folder", { accountId, folderPath });
 }
 
-// Contacts
-export async function listContactBooks(
+export function listContactBooks(
   accountId: string,
-): Promise<import("./types").ContactBook[]> {
+): Promise<Types.ContactBook[]> {
   return invoke("list_contact_books", { accountId });
 }
 
-export async function listContacts(
+export function listContacts(
   bookId: string,
-): Promise<import("./types").Contact[]> {
+): Promise<Types.Contact[]> {
   return invoke("list_contacts", { bookId });
 }
 
-export async function getContact(
-  contactId: string,
-): Promise<import("./types").Contact> {
-  return invoke("get_contact", { contactId });
-}
-
-export async function createContact(contact: {
+export function createContact(contact: {
   book_id: string;
   display_name: string;
   emails_json: string;
@@ -698,32 +639,28 @@ export async function createContact(contact: {
   return invoke("create_contact", { contact });
 }
 
-export async function updateContact(
-  contact: import("./types").Contact,
+export function updateContact(
+  contact: Types.Contact,
 ): Promise<void> {
   return invoke("update_contact", { contact });
 }
 
-export async function deleteContact(contactId: string): Promise<void> {
+export function deleteContact(contactId: string): Promise<void> {
   return invoke("delete_contact", { contactId });
 }
 
-export async function searchContacts(
+export function searchContacts(
   query: string,
-): Promise<import("./types").Contact[]> {
+): Promise<Types.Contact[]> {
   return invoke("search_contacts", { query });
 }
 
-/// Cross-account search that, when the (accountId, service) binding
-/// has a default contact book set, ranks matches in that book first.
-/// `service` is "mail" for compose recipients, "calendar" for event
-/// attendees. Pass undefined for either to fall back to plain
-/// alphabetical ordering — same shape as searchContacts.
-export async function searchContactsForAccount(
+/** Prioritizes the account/service default book; nulls use alphabetical order. */
+export function searchContactsForAccount(
   query: string,
   accountId: string | null,
   service: "mail" | "calendar" | null,
-): Promise<import("./types").Contact[]> {
+): Promise<Types.Contact[]> {
   return invoke("search_contacts_for_account", {
     query,
     accountId: accountId ?? null,
@@ -731,14 +668,14 @@ export async function searchContactsForAccount(
   });
 }
 
-export async function getDefaultContactBook(
+export function getDefaultContactBook(
   accountId: string,
   service: "mail" | "calendar",
 ): Promise<string | null> {
   return invoke("get_default_contact_book", { accountId, service });
 }
 
-export async function setDefaultContactBook(
+export function setDefaultContactBook(
   accountId: string,
   service: "mail" | "calendar",
   bookId: string | null,
@@ -750,30 +687,22 @@ export async function setDefaultContactBook(
   });
 }
 
-export async function syncContacts(accountId: string): Promise<void> {
+export function syncContacts(accountId: string): Promise<void> {
   return invoke("sync_contacts", { accountId });
 }
 
-// Meet (video conferencing — #148). One browser-assisted login
-// flow per provider (Talk / Matrix / Zoom today; the set is
-// driven by `meet::registry()` on the backend) plus one
-// provider-agnostic create-URL. Talk uses Nextcloud Login Flow
-// v2 (poll-based), Matrix uses SSO redirect to a local listener,
-// Zoom uses OAuth 2.0 Authorization Code + PKCE. All end with a
-// stored account row + keyring entry.
-
-export interface TalkLoginStart {
+interface TalkLoginStart {
   login_url: string;
   session_id: string;
 }
 
-export async function meetTalkLoginStart(
+export function meetTalkLoginStart(
   serverUrl: string,
 ): Promise<TalkLoginStart> {
   return invoke("meet_talk_login_start", { serverUrl });
 }
 
-export async function meetTalkLoginComplete(
+export function meetTalkLoginComplete(
   sessionId: string,
   displayName?: string,
 ): Promise<string> {
@@ -783,18 +712,18 @@ export async function meetTalkLoginComplete(
   });
 }
 
-export interface MatrixLoginStart {
+interface PortLoginStart {
   login_url: string;
   port: number;
 }
 
-export async function meetMatrixLoginStart(
+export function meetMatrixLoginStart(
   homeserverUrl: string,
-): Promise<MatrixLoginStart> {
+): Promise<PortLoginStart> {
   return invoke("meet_matrix_login_start", { homeserverUrl });
 }
 
-export async function meetMatrixLoginComplete(
+export function meetMatrixLoginComplete(
   port: number,
   displayName?: string,
 ): Promise<string> {
@@ -804,23 +733,15 @@ export async function meetMatrixLoginComplete(
   });
 }
 
-/// Zoom OAuth (#148). Hosted by Zoom — no per-user server URL,
-/// just an OAuth Authorization Code + PKCE round-trip against
-/// the Marketplace-registered app.
-export interface ZoomLoginStart {
-  login_url: string;
-  port: number;
-}
-
-export async function meetZoomLoginStart(
+export function meetZoomLoginStart(
   accountId?: string,
-): Promise<ZoomLoginStart> {
+): Promise<PortLoginStart> {
   return invoke("meet_zoom_login_start", {
     accountId: accountId ?? null,
   });
 }
 
-export async function meetZoomLoginComplete(
+export function meetZoomLoginComplete(
   port: number,
   displayName?: string,
 ): Promise<string> {
@@ -830,13 +751,12 @@ export async function meetZoomLoginComplete(
   });
 }
 
-/// La Suite Visio add-on exchange. The backend opens a restricted auth
-/// webview itself so the one-time transit token never enters renderer IPC.
-export interface VisioLoginStart {
+/** The backend owns Visio's auth webview so its transit token never enters IPC. */
+interface VisioLoginStart {
   session_id: string;
 }
 
-export async function meetVisioLoginStart(
+export function meetVisioLoginStart(
   serverUrl: string,
   accountId?: string,
 ): Promise<VisioLoginStart> {
@@ -846,7 +766,7 @@ export async function meetVisioLoginStart(
   });
 }
 
-export async function meetVisioLoginComplete(
+export function meetVisioLoginComplete(
   sessionId: string,
   displayName?: string,
 ): Promise<string> {
@@ -856,27 +776,17 @@ export async function meetVisioLoginComplete(
   });
 }
 
-export async function meetVisioLoginCancel(sessionId: string): Promise<void> {
+export function meetVisioLoginCancel(sessionId: string): Promise<void> {
   return invoke("meet_visio_login_cancel", { sessionId });
 }
 
-/// Provider-agnostic create — picks the registry entry matching
-/// the account's meet binding. Returns the join URL plus the
-/// provider-specific meeting id and the account/protocol used, so
-/// the caller can store the binding alongside its calendar event
-/// and later trigger a reschedule or delete on the same remote
-/// meeting.
-///
-/// `startTime` (ISO 8601 UTC) and `durationMinutes` are passed
-/// through to time-bound providers like Zoom so the meeting lands
-/// on the event's day rather than defaulting to "today". Persistent
-/// room providers (Talk, Matrix) ignore them.
-export async function meetCreateUrl(
+/** Creates through the account's provider; persistent rooms ignore the schedule. */
+export function meetCreateUrl(
   accountId: string,
   name: string,
   startTime?: string,
   durationMinutes?: number,
-): Promise<import("./types").MeetBinding> {
+): Promise<Types.MeetBinding> {
   return invoke("meet_create_url", {
     accountId,
     name,
@@ -886,27 +796,25 @@ export async function meetCreateUrl(
 }
 
 /** Idempotently discard a backend-owned unbound remote meeting. */
-export async function meetDiscardPending(lifecycleId: string): Promise<void> {
+export function meetDiscardPending(lifecycleId: string): Promise<void> {
   return invoke("meet_discard_pending", { lifecycleId });
 }
 
-// IDLE
-export async function startIdle(): Promise<void> {
+export function startIdle(): Promise<void> {
   return invoke("start_idle");
 }
 
-export async function stopIdle(): Promise<void> {
+export function stopIdle(): Promise<void> {
   return invoke("stop_idle");
 }
 
-// OAuth
-export async function oauthStart(
+export function oauthStart(
   provider: string,
 ): Promise<{ url: string; port: number }> {
   return invoke("oauth_start", { provider });
 }
 
-export async function oauthComplete(
+export function oauthComplete(
   provider: string,
   port: number,
   accountId: string,
@@ -914,26 +822,25 @@ export async function oauthComplete(
   return invoke("oauth_complete", { provider, port, accountId });
 }
 
-export async function oauthHasTokens(
+export function oauthHasTokens(
   accountId: string,
 ): Promise<boolean> {
   return invoke("oauth_has_tokens", { accountId });
 }
 
-export async function oauthGetMsProfile(
+export function oauthGetMsProfile(
   accountId: string,
 ): Promise<{ display_name: string; email: string }> {
   return invoke("oauth_get_ms_profile", { accountId });
 }
 
-export async function searchCollectedContacts(
+export function searchCollectedContacts(
   query: string,
-): Promise<import("./types").CollectedContact[]> {
+): Promise<Types.CollectedContact[]> {
   return invoke("search_collected_contacts", { query });
 }
 
-// JMAP OIDC (Device Authorization Flow)
-export async function jmapOidcStart(
+export function jmapOidcStart(
   jmapUrl: string,
   email: string,
   clientId: string,
@@ -950,7 +857,7 @@ export async function jmapOidcStart(
   return invoke("jmap_oidc_start", { jmapUrl, email, clientId });
 }
 
-export async function jmapOidcComplete(
+export function jmapOidcComplete(
   deviceCode: string,
   tokenEndpoint: string,
   interval: number,
@@ -968,119 +875,105 @@ export async function jmapOidcComplete(
   });
 }
 
-export async function openOauthUrl(url: string): Promise<void> {
+export function openOauthUrl(url: string): Promise<void> {
   return invoke("open_oauth_url", { url });
 }
 
-export async function cleanUrl(url: string): Promise<string> {
+export function cleanUrl(url: string): Promise<string> {
   return invoke("clean_url", { url });
 }
 
-export async function openLink(url: string): Promise<void> {
+export function openLink(url: string): Promise<void> {
   return invoke("open_link", { url });
 }
 
-export async function listTimezones(): Promise<string[]> {
+export function listTimezones(): Promise<string[]> {
   return invoke("list_timezones");
 }
 
-export async function getDefaultTimezone(): Promise<string> {
+export function getDefaultTimezone(): Promise<string> {
   return invoke("get_default_timezone");
 }
 
-// Outbox
-export async function listOutbox(
+export function listOutbox(
   accountId: string,
-): Promise<import("./types").OutboxRow[]> {
+): Promise<Types.OutboxRow[]> {
   return invoke("list_outbox", { accountId });
 }
 
-export async function retryOutboxOp(
+export function retryOutboxOp(
   accountId: string,
   outboxId: number,
 ): Promise<void> {
   return invoke("retry_outbox_op", { accountId, outboxId });
 }
 
-export async function discardOutboxOp(
+export function discardOutboxOp(
   accountId: string,
   outboxId: number,
 ): Promise<void> {
   return invoke("discard_outbox_op", { accountId, outboxId });
 }
 
-// OpenPGP
-export async function pgpListKeys(): Promise<import("./types").PgpKeySummary[]> {
+export function pgpListKeys(): Promise<Types.PgpKeySummary[]> {
   return invoke("pgp_list_keys");
 }
 
-export async function pgpGetKey(
-  fingerprint: string,
-): Promise<import("./types").PgpKeySummary> {
-  return invoke("pgp_get_key", { fingerprint });
-}
-
-export async function pgpImportKey(
+export function pgpImportKey(
   data: Uint8Array,
-): Promise<import("./types").PgpImportResult> {
-  // Tauri serialises Uint8Array → JSON array of numbers — backend command
-  // takes Vec<u8>.
+): Promise<Types.PgpImportResult> {
+  // Tauri serializes Uint8Array as numbers for the backend Vec<u8>.
   return invoke("pgp_import_key", { data: Array.from(data) });
 }
 
-/** Opens the native file dialog server-side and imports the picked file.
- *  Returns null if the user cancels. */
-export async function pgpPickAndImportKey(): Promise<
-  import("./types").PgpImportResult | null
-> {
+/** Returns null when the native file picker is cancelled. */
+export function pgpPickAndImportKey(): Promise<Types.PgpImportResult | null> {
   return invoke("pgp_pick_and_import_key");
 }
 
-export async function pgpDeleteKey(fingerprint: string): Promise<void> {
+export function pgpDeleteKey(fingerprint: string): Promise<void> {
   return invoke("pgp_delete_key", { fingerprint });
 }
 
-export async function pgpExportPublic(fingerprint: string): Promise<string> {
+export function pgpExportPublic(fingerprint: string): Promise<string> {
   return invoke("pgp_export_public", { fingerprint });
 }
 
 /** Returns the fingerprint of the imported key. */
-export async function pgpWkdFetch(email: string): Promise<string> {
+export function pgpWkdFetch(email: string): Promise<string> {
   return invoke("pgp_wkd_fetch", { email });
 }
 
-export async function pgpListCards(): Promise<import("./types").PgpCardSummary[]> {
+export function pgpListCards(): Promise<Types.PgpCardSummary[]> {
   return invoke("pgp_list_cards");
 }
 
-export async function pgpCardDetails(
+export function pgpCardDetails(
   ident: string,
-): Promise<import("./types").PgpCardDetails> {
+): Promise<Types.PgpCardDetails> {
   return invoke("pgp_card_details", { ident });
 }
 
-export async function pgpAutoLinkCards(): Promise<
-  import("./types").PgpCardDetection[]
-> {
+export function pgpAutoLinkCards(): Promise<Types.PgpCardDetection[]> {
   return invoke("pgp_auto_link_cards");
 }
 
-export async function pgpDecryptMessage(
+export function pgpDecryptMessage(
   accountId: string,
   messageId: string,
-): Promise<import("./types").PgpDecryptedMessage> {
+): Promise<Types.PgpDecryptedMessage> {
   return invoke("pgp_decrypt_message", { accountId, messageId });
 }
 
-export async function pgpVerifyMessage(
+export function pgpVerifyMessage(
   accountId: string,
   messageId: string,
-): Promise<import("./types").PgpVerifyOutcome> {
+): Promise<Types.PgpVerifyOutcome> {
   return invoke("pgp_verify_message", { accountId, messageId });
 }
 
-export async function pgpCheckRecipients(
+export function pgpCheckRecipients(
   recipients: string[],
-): Promise<import("./types").PgpRecipientStatus[]> {
+): Promise<Types.PgpRecipientStatus[]> {
   return invoke("pgp_check_recipients", { recipients });
 }

@@ -6,7 +6,6 @@ import { setActivePinia, createPinia } from "pinia";
 // for the cases they actually exercise.
 vi.mock("@/lib/tauri", () => ({
   pgpListKeys: vi.fn().mockResolvedValue([]),
-  pgpGetKey: vi.fn(),
   pgpImportKey: vi.fn().mockResolvedValue({
     fingerprint: "AAAA1111BBBB2222CCCC3333DDDD4444EEEE5555",
     isSecret: true,
