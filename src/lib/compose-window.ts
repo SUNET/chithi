@@ -10,39 +10,40 @@ export interface ComposeParams {
   bcc?: string;
   subject?: string;
   body?: string;
-  /** chithi message id of a saved draft to resume. When set, ComposeView
-   *  fetches the draft (decrypting it first if it's an encrypted draft)
-   *  and pre-fills the form. Mutually exclusive with the reply/prefill
-   *  params above in practice. */
   draftId?: string;
-  /** Pre-arm the Encrypt toggle (e.g. replying to an encrypted message). */
   pgpEncrypt?: boolean;
-  /** Pre-arm the Sign toggle. ComposeView still gates this on the From
-   *  account actually having a usable signing key. */
+  /** Requested initial state; signing still requires a usable account key. */
   pgpSign?: boolean;
 }
 
+const TEXT_QUERY_KEYS = [
+  "accountId",
+  "replyTo",
+  "to",
+  "cc",
+  "bcc",
+  "subject",
+  "body",
+  "draftId",
+] as const;
+
 export function openComposeWindow(params: ComposeParams = {}) {
-  composeCounter++;
+  composeCounter += 1;
   const label = `compose-${composeCounter}`;
 
   const query = new URLSearchParams();
-  if (params.accountId) query.set("accountId", params.accountId);
-  if (params.replyTo) query.set("replyTo", params.replyTo);
-  if (params.to) query.set("to", params.to);
-  if (params.cc) query.set("cc", params.cc);
-  if (params.bcc) query.set("bcc", params.bcc);
-  if (params.subject) query.set("subject", params.subject);
-  if (params.body) query.set("body", params.body);
-  if (params.draftId) query.set("draftId", params.draftId);
+  for (const key of TEXT_QUERY_KEYS) {
+    const value = params[key];
+    if (value) query.set(key, value);
+  }
   if (params.pgpEncrypt) query.set("pgpEncrypt", "1");
   if (params.pgpSign) query.set("pgpSign", "1");
 
-  const queryStr = query.toString();
-  const url = queryStr ? `/compose?${queryStr}` : "/compose";
+  const queryString = query.toString();
+  const url = queryString ? `/compose?${queryString}` : "/compose";
 
-  const titleSuffix = params.subject ? params.subject : "(no subject)";
-  const win = new WebviewWindow(label, {
+  const titleSuffix = params.subject || "(no subject)";
+  const composeWindow = new WebviewWindow(label, {
     url,
     title: `Write ${titleSuffix} - Chithi`,
     width: 1024,
@@ -52,7 +53,7 @@ export function openComposeWindow(params: ComposeParams = {}) {
     focus: true,
   });
 
-  win.once("tauri://error", (e) => {
-    console.error("Failed to create compose window:", e);
+  composeWindow.once("tauri://error", (error) => {
+    console.error("Failed to create compose window:", error);
   });
 }
