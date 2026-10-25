@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { ref } from "vue";
 import * as api from "@/lib/tauri";
+import { parseEmails } from "@/lib/contact-json";
 
 const props = defineProps<{
   modelValue: string[];
@@ -16,14 +17,8 @@ const suggestions = ref<{ display: string; email: string }[]>([]);
 const acVisible = ref(false);
 const acIndex = ref(-1);
 let acDebounce: ReturnType<typeof setTimeout> | null = null;
-// Monotonic id of the latest user input. Each runSearch captures the
-// id at call time and discards its result if a newer input has
-// landed in the meantime — without this the IPC roundtrip can race
-// (type "alic", "alice", in quick succession, the older response
-// arrives second and overwrites the fresher results).
+// Discard search responses superseded by newer input.
 let acRequestSeq = 0;
-
-const accountIdForSearch = computed(() => props.accountId ?? null);
 
 function addAttendee(email?: string) {
   const value = (email ?? newEmail.value).trim();
@@ -42,16 +37,14 @@ function removeAttendee(email: string) {
 
 async function runSearch(query: string, seq: number) {
   try {
-    const contacts = accountIdForSearch.value
-      ? await api.searchContactsForAccount(query, accountIdForSearch.value, "calendar")
+    const contacts = props.accountId
+      ? await api.searchContactsForAccount(query, props.accountId, "calendar")
       : await api.searchContacts(query);
     if (seq !== acRequestSeq) return;
     const items: { display: string; email: string }[] = [];
     const seen = new Set<string>();
     for (const c of contacts) {
-      let emails: { email: string; label?: string }[] = [];
-      try { emails = JSON.parse(c.emails_json); } catch { continue; }
-      for (const e of emails) {
+      for (const e of parseEmails(c.emails_json)) {
         const key = e.email.toLowerCase();
         if (seen.has(key) || props.modelValue.includes(e.email)) continue;
         seen.add(key);
@@ -72,16 +65,11 @@ async function runSearch(query: string, seq: number) {
 }
 
 function onInput() {
-  // Always cancel any pending debounce — even on the short-query
-  // branch — so a search scheduled for an earlier longer query can't
-  // fire after the user has backspaced down to a too-short input
-  // and silently re-populate the dropdown they just dismissed.
+  // Shorter input must also cancel searches scheduled by older input.
   if (acDebounce) {
     clearTimeout(acDebounce);
     acDebounce = null;
   }
-  // Bump the request id so any in-flight runSearch from a previous
-  // keystroke discards its result on completion.
   acRequestSeq += 1;
   const seq = acRequestSeq;
   const q = newEmail.value.trim();
@@ -90,7 +78,7 @@ function onInput() {
     acVisible.value = false;
     return;
   }
-  acDebounce = setTimeout(() => runSearch(q, seq), 150);
+  acDebounce = setTimeout(() => void runSearch(q, seq), 150);
 }
 
 function onKeydown(event: KeyboardEvent) {
