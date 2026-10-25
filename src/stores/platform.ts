@@ -1,11 +1,9 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 
-/** Breakpoint: below this width, render the mobile chrome. */
 const MOBILE_MAX = 720;
-const TABLET_MAX = 1024;
 
-export type PlatformKind = "ios" | "android" | "desktop";
+type PlatformKind = "ios" | "android" | "desktop";
 
 export const usePlatformStore = defineStore("platform", () => {
   const width = ref(
@@ -15,17 +13,12 @@ export const usePlatformStore = defineStore("platform", () => {
   const platformReady = ref(false);
 
   const isMobile = computed(() => width.value < MOBILE_MAX);
-  const isTablet = computed(
-    () => width.value >= MOBILE_MAX && width.value < TABLET_MAX,
-  );
-  const isDesktop = computed(() => width.value >= TABLET_MAX);
 
   const onResize = () => {
     width.value = window.innerWidth;
   };
 
   async function detectPlatform() {
-    // Tauri v2 mobile build exposes platform via plugin-os.
     try {
       const { platform } = await import("@tauri-apps/plugin-os");
       const p = await platform();
@@ -33,7 +26,6 @@ export const usePlatformStore = defineStore("platform", () => {
       else if (p === "android") kind.value = "android";
       else kind.value = "desktop";
     } catch {
-      // Running outside Tauri (pnpm dev in a browser) — UA sniff fallback.
       const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
       if (/android/i.test(ua)) kind.value = "android";
       else if (/iphone|ipad|ipod/i.test(ua)) kind.value = "ios";
@@ -52,19 +44,11 @@ export const usePlatformStore = defineStore("platform", () => {
     void detectPlatform();
   }
 
-  function dispose() {
-    if (typeof window === "undefined") return;
-    window.removeEventListener("resize", onResize);
-  }
-
   return {
     width,
     kind,
     platformReady,
     isMobile,
-    isTablet,
-    isDesktop,
     init,
-    dispose,
   };
 });
