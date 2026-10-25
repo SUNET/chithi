@@ -36,13 +36,7 @@ const defaultStart = props.initialStart
   : new Date();
 const defaultEnd = new Date(defaultStart.getTime() + 60 * 60 * 1000);
 
-/// Accounts that can produce a meeting URL (#148). Pulled from the
-/// account summary's `meet_protocol` so we can label the dropdown
-/// with "Nextcloud Talk" / "Matrix" alongside the account name.
-/// Map `meet_protocol` values to the human-readable label that
-/// goes on the "Add <provider>" buttons. Adding a new provider
-/// = one new entry in this map; rest of the component picks it
-/// up from `meetAccountOptions`.
+// Meeting-capable account protocols and their button labels.
 const MEET_PROTOCOL_LABELS: Record<string, string> = {
   talk: "Nextcloud Talk",
   matrix: "Matrix",
@@ -60,10 +54,7 @@ const meetAccountOptions = computed(() =>
 );
 const generatingMeetUrl = ref(false);
 const meetError = ref<string | null>(null);
-/** Provider handle for the meeting we just created in this form
- * session. Persisted with the event on save so later edits /
- * cancellations can act on the same remote room. Reset when the
- * user replaces the meet URL (handled in `save()`). */
+/** Unsaved remote meeting owned by this form. */
 const pendingMeetBinding = ref<import("@/lib/types").MeetBinding | null>(null);
 const closing = ref(false);
 let meetCreationPromise: Promise<void> | null = null;
@@ -71,9 +62,9 @@ let meetCreationPromise: Promise<void> | null = null;
 async function discardMeetBinding(binding: import("@/lib/types").MeetBinding) {
   try {
     await api.meetDiscardPending(binding.lifecycle_id);
-  } catch (e) {
+  } catch (error) {
     // The backend retains durable ownership and retries on startup.
-    console.error("Failed to discard pending meeting:", e);
+    console.error("Failed to discard pending meeting:", error);
   }
 }
 
@@ -110,45 +101,17 @@ async function addVideoLink(accountId: string) {
   meetError.value = null;
   const operation = (async () => {
     try {
-      // Pass the event's start + duration so time-bound providers
-      // (Zoom) schedule the meeting on the event's day, not today.
-      // All-day events pin the start at noon in the user's display
-      // timezone (converted to UTC) so Zoom's UI shows the meeting
-      // on the right calendar day regardless of timezone, and use a
-      // 24h duration to cover the full day. Pinning at midnight
-      // instead would flip to the previous/next day in some
-      // timezones; noon avoids that.
-      let startIso: string;
-      let durationMinutes: number;
-      if (allDay.value) {
-        startIso = localInputToUTC(
-          startDate.value,
-          "12:00",
-          uiStore.displayTimezone,
-        );
-        durationMinutes = 24 * 60;
-      } else {
-        const startUTC = localInputToUTC(
-          startDate.value,
-          startTime.value,
-          uiStore.displayTimezone,
-        );
-        const endUTC = localInputToUTC(
-          endDate.value,
-          endTime.value,
-          uiStore.displayTimezone,
-        );
-        startIso = startUTC;
-        durationMinutes = Math.max(
-          1,
-          Math.round((new Date(endUTC).getTime() - new Date(startUTC).getTime()) / 60000),
-        );
-      }
+      // Noon anchors all-day meetings to the intended local calendar date.
+      const startIso = localInputToUTC(
+        startDate.value,
+        allDay.value ? "12:00" : startTime.value,
+        uiStore.displayTimezone,
+      );
       const binding = await api.meetCreateUrl(
         accountId,
         title.value || "Meeting",
         startIso,
-        durationMinutes,
+        eventDurationMinutes.value,
       );
       if (closing.value) {
         await discardMeetBinding(binding);
@@ -162,9 +125,9 @@ async function addVideoLink(accountId: string) {
         ? `Join: ${binding.join_url}\n\n${description.value}`
         : `Join: ${binding.join_url}`;
       if (previousBinding) await discardMeetBinding(previousBinding);
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      meetError.value = `Could not create meeting: ${msg}`;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      meetError.value = `Could not create meeting: ${message}`;
     }
   })();
   meetCreationPromise = operation;
@@ -182,10 +145,6 @@ const startTime = ref(toTimeInTimezone(defaultStart, uiStore.displayTimezone));
 const endDate = ref(toDateInTimezone(defaultEnd, uiStore.displayTimezone));
 const endTime = ref(toTimeInTimezone(defaultEnd, uiStore.displayTimezone));
 
-/** Minimum end date: cannot be before start date */
-const minEndDate = computed(() => startDate.value);
-
-/** Minimum end time: if same day, cannot be before start time */
 const minEndTime = computed(() => {
   if (endDate.value === startDate.value) {
     return startTime.value;
@@ -193,7 +152,6 @@ const minEndTime = computed(() => {
   return undefined;
 });
 
-// When start moves past end, push end forward
 watch([startDate, startTime], () => {
   const sISO = localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
   const eISO = localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
@@ -208,12 +166,12 @@ const location = ref("");
 const description = ref("");
 const calendarId = ref(calendarStore.calendars[0]?.id ?? "");
 
-// Account that owns the picked calendar — passed to AttendeeEditor
-// so its autocomplete can hit that account's calendar binding's
-// default contact book first (#137).
+// Drives account-scoped attendee and room lookup.
 const selectedCalendarAccountId = computed(() => {
-  const cal = calendarStore.calendars.find((c) => c.id === calendarId.value);
-  return cal?.account_id ?? null;
+  const calendar = calendarStore.calendars.find(
+    (candidate) => candidate.id === calendarId.value,
+  );
+  return calendar?.account_id ?? null;
 });
 const recurrenceRule = ref<string | null>(null);
 const attendeeEmails = ref<string[]>([]);
@@ -306,8 +264,8 @@ async function loadSchedulingAssistant() {
     rangeEndDate.setUTCDate(rangeEndDate.getUTCDate() + 14);
     const rangeEnd = localInputToUTC(rangeEndDate.toISOString().slice(0, 10), "00:00", uiStore.displayTimezone);
     participantSchedules.value = await api.getParticipantSchedules(accountId, emails, rangeStart, rangeEnd);
-  } catch (e) {
-    schedulingError.value = e instanceof Error ? e.message : String(e);
+  } catch (error) {
+    schedulingError.value = error instanceof Error ? error.message : String(error);
   } finally {
     loadingSchedules.value = false;
   }
@@ -329,18 +287,15 @@ function selectedRoom() {
 }
 
 function currentScheduleRange() {
-  // All-day events still need a concrete UTC window for the Graph
-  // getSchedule query, and that window is the day boundaries in the
-  // user's display timezone — not UTC midnight. A Stockholm all-day
-  // event on May 19 actually runs 2026-05-18T22:00Z..2026-05-19T22:00Z.
-  const tz = uiStore.displayTimezone;
+  // All-day availability uses display-timezone boundaries, not UTC midnight.
+  const timezone = uiStore.displayTimezone;
   return {
     start: allDay.value
-      ? localInputToUTC(startDate.value, "00:00", tz)
-      : localInputToUTC(startDate.value, startTime.value, tz),
+      ? localInputToUTC(startDate.value, "00:00", timezone)
+      : localInputToUTC(startDate.value, startTime.value, timezone),
     end: allDay.value
-      ? localInputToUTC(endDate.value, "23:59", tz)
-      : localInputToUTC(endDate.value, endTime.value, tz),
+      ? localInputToUTC(endDate.value, "23:59", timezone)
+      : localInputToUTC(endDate.value, endTime.value, timezone),
   };
 }
 
@@ -378,10 +333,7 @@ const roomAvailabilityMessage = computed(() => {
 });
 
 async function refreshRoomAvailability() {
-  // Claim a request id up front so any in-flight check is invalidated
-  // immediately — including when we bail out below. Otherwise a slower
-  // earlier response could still match its id and repopulate a stale
-  // message for a room/time that is no longer selected.
+  // Increment before validation so early returns also invalidate older requests.
   const requestId = ++roomAvailabilityRequestId;
 
   const room = selectedRoom();
@@ -406,9 +358,9 @@ async function refreshRoomAvailability() {
     if (requestId === roomAvailabilityRequestId) {
       roomAvailability.value = availability;
     }
-  } catch (e) {
+  } catch (error) {
     if (requestId === roomAvailabilityRequestId) {
-      console.error("Failed to check room availability:", e);
+      console.error("Failed to check room availability:", error);
       roomAvailability.value = { state: "unknown", busy_start: null, busy_end: null };
     }
   } finally {
@@ -419,9 +371,7 @@ async function refreshRoomAvailability() {
 }
 
 async function refreshRoomSuggestions() {
-  // Claim a request id so a slower load for a previously selected
-  // account can't overwrite the current account's suggestions when
-  // the user switches calendars/accounts mid-flight.
+  // Discard results for calendars superseded while loading.
   const requestId = ++roomSuggestionsRequestId;
 
   const accountId = selectedCalendarAccountId.value;
@@ -439,11 +389,11 @@ async function refreshRoomSuggestions() {
       return;
     }
     roomSuggestions.value = suggestions;
-  } catch (e) {
+  } catch (error) {
     if (requestId !== roomSuggestionsRequestId) {
       return;
     }
-    console.error("Failed to load room suggestions:", e);
+    console.error("Failed to load room suggestions:", error);
     roomSuggestions.value = [];
     roomAvailability.value = null;
   } finally {
@@ -485,8 +435,10 @@ async function save() {
   saving.value = true;
   error.value = null;
 
-  const cal = calendarStore.calendars.find((c) => c.id === calendarId.value);
-  const accountId = cal?.account_id ?? accountsStore.activeAccountId ?? "";
+  const calendar = calendarStore.calendars.find(
+    (candidate) => candidate.id === calendarId.value,
+  );
+  const accountId = calendar?.account_id ?? accountsStore.activeAccountId ?? "";
 
   try {
     if (meetCreationPromise) await meetCreationPromise;
@@ -498,7 +450,6 @@ async function save() {
       ? `${endDate.value}T23:59:59Z`
       : localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
 
-    // A changed location explicitly relinquishes this form's remote room.
     if (
       pendingMeetBinding.value &&
       location.value !== pendingMeetBinding.value.join_url
@@ -523,26 +474,28 @@ async function save() {
       all_day: allDay.value,
       timezone: uiStore.displayTimezone,
       recurrence_rule: recurrenceRule.value,
-      attendees: attendeeEmails.value.map((e) => ({ email: e, name: null, status: "needs-action" })),
+      attendees: attendeeEmails.value.map((email) => ({
+        email,
+        name: null,
+        status: "needs-action",
+      })),
       meet_binding: meetBinding,
     });
-    // createEvent atomically claimed the lifecycle; this form must no longer
-    // discard it, even while invite delivery is still running.
+    // The saved event now owns the remote meeting lifecycle.
     if (meetBinding) pendingMeetBinding.value = null;
 
-    // Send invite emails if attendees were added
     if (attendeeEmails.value.length > 0) {
       try {
         await api.sendInvites(accountId, eventId, attendeeEmails.value);
-      } catch (e) {
-        console.error("Failed to send invites:", e);
+      } catch (inviteError) {
+        console.error("Failed to send invites:", inviteError);
       }
     }
 
     emit("saved");
     emit("close");
-  } catch (e) {
-    error.value = String(e);
+  } catch (saveError) {
+    error.value = String(saveError);
   } finally {
     saving.value = false;
   }
@@ -588,7 +541,7 @@ async function save() {
           <div class="form-group">
             <label>End</label>
             <div class="datetime-inputs">
-              <DateInput v-model="endDate" class="date-input" :min="minEndDate" testid="event-form-end" />
+              <DateInput v-model="endDate" class="date-input" :min="startDate" testid="event-form-end" />
               <TimeInput v-if="!allDay" v-model="endTime" class="time-input" :min="minEndTime" testid="event-form-end-time" />
             </div>
           </div>
@@ -631,12 +584,6 @@ async function save() {
           >
             {{ roomAvailabilityMessage }}
           </span>
-          <!-- #148: one-click video conference. Only renders when
-               at least one account has a meet binding configured
-               in Settings. Picking an entry creates the room /
-               call on that provider and appends the join URL to
-               this Location field plus a Join: line in the
-               description below. -->
           <div
             v-if="meetAccountOptions.length > 0"
             class="meet-row"
@@ -754,7 +701,6 @@ async function save() {
   color: var(--color-accent);
   cursor: pointer;
 }
-/* "Add video conference" buttons under the Location input (#148). */
 .meet-row {
   display: flex;
   flex-wrap: wrap;
@@ -891,10 +837,7 @@ async function save() {
   color: var(--color-text);
 }
 
-/* Sizing tokens consumed by DateInput / TimeInput so they visually match
-   the sibling native <input>/<select> elements. CSS custom properties
-   cross the scoped-styles boundary that :deep would otherwise be needed
-   for. */
+/* Shared sizing tokens for DateInput and TimeInput. */
 .form-group {
   --input-height: 36px;
   --input-padding: 0 12px;
