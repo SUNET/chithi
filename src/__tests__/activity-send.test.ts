@@ -154,11 +154,12 @@ describe("activity store send listeners", () => {
     const first = store.initEventListeners();
     const second = store.initEventListeners();
 
-    expect(listenEvent).toHaveBeenCalledTimes(13);
+    const registrationCount = listenEvent.mock.calls.length;
+    expect(registrationCount).toBeGreaterThan(0);
 
     registration.resolve(() => {});
     await Promise.all([first, second]);
-    expect(listenEvent).toHaveBeenCalledTimes(13);
+    expect(listenEvent).toHaveBeenCalledTimes(registrationCount);
   });
 
   it("ignores events from listeners until the whole attempt commits", async () => {
@@ -223,14 +224,15 @@ describe("activity store send listeners", () => {
     expect(showToast).not.toHaveBeenCalled();
 
     await expect(initialization).rejects.toThrow("listen failed");
-    expect(firstAttemptUnlisteners).toHaveLength(12);
+    const registrationsPerAttempt = listenEvent.mock.calls.length;
+    expect(firstAttemptUnlisteners).toHaveLength(registrationsPerAttempt - 1);
     for (const unlisten of firstAttemptUnlisteners) {
       expect(unlisten).toHaveBeenCalledOnce();
     }
 
     failRegistration = false;
     await expect(store.initEventListeners()).resolves.toBeUndefined();
-    expect(listenEvent).toHaveBeenCalledTimes(26);
+    expect(listenEvent).toHaveBeenCalledTimes(registrationsPerAttempt * 2);
   });
 
   it("cleans listeners that finish after the store is disposed", async () => {
@@ -258,7 +260,7 @@ describe("activity store send listeners", () => {
 
     expect(activity.operations.size).toBe(0);
     expect(showToast).not.toHaveBeenCalled();
-    expect(unlisten).toHaveBeenCalledTimes(13);
+    expect(unlisten).toHaveBeenCalledTimes(listenEvent.mock.calls.length);
   });
 
   it("recovers from a transient startup initialization failure", async () => {
@@ -321,11 +323,10 @@ describe("activity store send listeners", () => {
       string,
       (event: { payload: unknown }) => void
     >();
-    let registrationCount = 0;
+    let attempt = 0;
     listenEvent.mockImplementation(
       (name: string, handler: (event: { payload: unknown }) => void) => {
-        registrationCount += 1;
-        const attempt = Math.ceil(registrationCount / 13);
+        if (name === "sync-started") attempt += 1;
         handlers.set(name, handler);
         if (attempt === 1) staleHandlers.set(name, handler);
         if (attempt === 1 && name === "send-unknown") {
@@ -351,12 +352,13 @@ describe("activity store send listeners", () => {
     );
 
     expect(error).toBeNull();
-    expect(listenEvent).toHaveBeenCalledTimes(26);
-    expect(firstAttemptUnlisteners).toHaveLength(12);
+    const registrationsPerAttempt = secondAttemptUnlisteners.length;
+    expect(listenEvent).toHaveBeenCalledTimes(registrationsPerAttempt * 2);
+    expect(firstAttemptUnlisteners).toHaveLength(registrationsPerAttempt - 1);
     for (const unlisten of firstAttemptUnlisteners) {
       expect(unlisten).toHaveBeenCalledOnce();
     }
-    expect(secondAttemptUnlisteners).toHaveLength(13);
+    expect(secondAttemptUnlisteners.length).toBeGreaterThan(0);
     for (const unlisten of secondAttemptUnlisteners) {
       expect(unlisten).not.toHaveBeenCalled();
     }

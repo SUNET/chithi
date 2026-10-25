@@ -4,9 +4,63 @@ import { listen } from "@tauri-apps/api/event";
 import type { Event, UnlistenFn } from "@tauri-apps/api/event";
 import { showToast, dismissToast } from "@/lib/toast";
 
-async function wait(ms: number): Promise<void> {
-  if (ms <= 0) return;
-  await new Promise<void>((resolve) => setTimeout(resolve, ms));
+const COMPLETED_OPERATION_RETENTION_MS = 60_000;
+const FAILED_OPERATION_RETENTION_MS = 5 * 60_000;
+const SEND_FAILURE_TOAST_DURATION_MS = 10_000;
+
+interface SyncStartedPayload {
+  account_id: string;
+  account_name: string;
+}
+
+interface SyncProgressPayload {
+  account_id: string;
+  folder: string;
+  synced: number;
+  total_folders: number;
+  current_folder: number;
+}
+
+interface SyncCompletePayload {
+  account_id: string;
+  total_synced: number;
+}
+
+interface AccountErrorPayload {
+  account_id: string;
+  error: string;
+}
+
+interface OperationFailurePayload extends AccountErrorPayload {
+  op_type: string;
+}
+
+interface SendPayload {
+  account_id: string;
+  subject: string;
+  outbox_id: number;
+}
+
+interface SendFailurePayload extends SendPayload {
+  error: string;
+}
+
+function mailSyncOperationId(accountId: string): string {
+  return `sync-${accountId}`;
+}
+
+function calendarSyncOperationId(accountId: string): string {
+  return `cal-sync-${accountId}`;
+}
+
+function sendOperationId(outboxId: number): string {
+  return `send-${outboxId}`;
+}
+
+function wait(ms: number): Promise<void> {
+  return ms > 0
+    ? new Promise<void>((resolve) => setTimeout(resolve, ms))
+    : Promise.resolve();
 }
 
 async function initializeWithTimeout(
@@ -56,7 +110,7 @@ export async function initializeActivityListenersWithRetry(
   return lastError;
 }
 
-export interface Operation {
+interface Operation {
   id: string;
   type: "sync" | "send" | "general";
   label: string;
@@ -71,21 +125,36 @@ export const useActivityStore = defineStore("activity", () => {
   const initialized = ref(false);
 
   const activeOperations = computed(() =>
-    Array.from(operations.value.values()).filter((op) => op.status === "running"),
+    Array.from(operations.value.values()).filter(
+      (operation) => operation.status === "running",
+    ),
   );
 
   const recentOperations = computed(() => {
-    const all = Array.from(operations.value.values());
-    all.sort((a, b) => b.startedAt - a.startedAt);
-    return all.slice(0, 10);
+    const sorted = Array.from(operations.value.values());
+    sorted.sort((a, b) => b.startedAt - a.startedAt);
+    return sorted.slice(0, 10);
   });
 
   const hasActiveOperations = computed(() => activeOperations.value.length > 0);
 
-  // Pending removal timers keyed by operation id. A second op that reuses an
-  // id (e.g. a repeated sync for the same account) must cancel the earlier
-  // timer, or the stale timer would wipe out the new "running" entry mid-run.
+  // Reused IDs must cancel stale timers that could remove a newer operation.
   const pendingRemovals = new Map<string, ReturnType<typeof setTimeout>>();
+
+  function publishOperations(): void {
+    operations.value = new Map(operations.value);
+  }
+
+  function mutateOperation(
+    id: string,
+    mutate: (operation: Operation) => void,
+  ): boolean {
+    const operation = operations.value.get(id);
+    if (!operation) return false;
+    mutate(operation);
+    publishOperations();
+    return true;
+  }
 
   function cancelPendingRemoval(id: string) {
     const handle = pendingRemovals.get(id);
@@ -99,12 +168,13 @@ export const useActivityStore = defineStore("activity", () => {
     cancelPendingRemoval(id);
     const handle = setTimeout(() => {
       pendingRemovals.delete(id);
-      const op = operations.value.get(id);
-      // Guard against a new "running" op having taken the same id since we
-      // were scheduled. We only auto-remove terminal entries.
-      if (op && (op.status === "done" || op.status === "error")) {
+      const operation = operations.value.get(id);
+      if (
+        operation &&
+        (operation.status === "done" || operation.status === "error")
+      ) {
         operations.value.delete(id);
-        operations.value = new Map(operations.value);
+        publishOperations();
       }
     }, ms);
     pendingRemovals.set(id, handle);
@@ -116,7 +186,6 @@ export const useActivityStore = defineStore("activity", () => {
     label: string,
     detail: string = "",
   ): string {
-    // A fresh run with the same id supersedes any pending removal.
     cancelPendingRemoval(id);
     operations.value.set(id, {
       id,
@@ -126,39 +195,34 @@ export const useActivityStore = defineStore("activity", () => {
       status: "running",
       startedAt: Date.now(),
     });
-    // Trigger reactivity
-    operations.value = new Map(operations.value);
+    publishOperations();
     return id;
   }
 
   function updateOperation(id: string, detail: string) {
-    const op = operations.value.get(id);
-    if (op) {
-      op.detail = detail;
-      operations.value = new Map(operations.value);
-    }
+    mutateOperation(id, (operation) => {
+      operation.detail = detail;
+    });
   }
 
   function completeOperation(id: string, detail?: string) {
-    const op = operations.value.get(id);
-    if (op) {
-      op.status = "done";
-      if (detail) op.detail = detail;
-      operations.value = new Map(operations.value);
-      // Auto-remove after 60 seconds (visible in operations panel)
-      scheduleRemoval(id, 60_000);
+    const updated = mutateOperation(id, (operation) => {
+      operation.status = "done";
+      if (detail) operation.detail = detail;
+    });
+    if (updated) {
+      scheduleRemoval(id, COMPLETED_OPERATION_RETENTION_MS);
     }
   }
 
   function failOperation(id: string, error: string) {
-    const op = operations.value.get(id);
-    if (op) {
-      op.status = "error";
-      op.error = error;
-      op.detail = error;
-      operations.value = new Map(operations.value);
-      // Auto-remove errors after 5 minutes
-      scheduleRemoval(id, 5 * 60_000);
+    const updated = mutateOperation(id, (operation) => {
+      operation.status = "error";
+      operation.error = error;
+      operation.detail = error;
+    });
+    if (updated) {
+      scheduleRemoval(id, FAILED_OPERATION_RETENTION_MS);
     }
   }
 
@@ -169,11 +233,11 @@ export const useActivityStore = defineStore("activity", () => {
   let nextInitializationAttemptId = 0;
   let disposed = false;
 
-  function dismissSendToast(opId: string) {
-    const toastId = sendToastIds.get(opId);
+  function dismissSendToast(operationId: string) {
+    const toastId = sendToastIds.get(operationId);
     if (toastId !== undefined) {
       dismissToast(toastId);
-      sendToastIds.delete(opId);
+      sendToastIds.delete(operationId);
     }
   }
 
@@ -197,7 +261,9 @@ export const useActivityStore = defineStore("activity", () => {
     });
     const cancelAttempt = () => {
       if (!acceptingListeners || committed) return;
-      const reason = signal?.reason ?? new Error("Activity listener initialization cancelled");
+      const reason =
+        signal?.reason ??
+        new Error("Activity listener initialization cancelled");
       cleanupAttempt();
       rejectCancellation(reason);
     };
@@ -207,205 +273,121 @@ export const useActivityStore = defineStore("activity", () => {
       signal?.addEventListener("abort", cancelAttempt, { once: true });
     }
 
-    function whenCommitted<T>(handler: (event: Event<T>) => void) {
+    function whenCommitted<T>(handler: (payload: T) => void) {
       return (event: Event<T>) => {
         if (!committed || disposed) return;
-        handler(event);
+        handler(event.payload);
       };
     }
 
-    // --- Mail sync events ---
-    registrations.push(
-      listen<{ account_id: string; account_name: string }>(
-        "sync-started",
-        whenCommitted((event) => {
-          startOperation(
-            `sync-${event.payload.account_id}`,
-            "sync",
-            `Syncing ${event.payload.account_name}`,
-            "Syncing...",
-          );
-        }),
-      ),
-    );
+    function register<T>(name: string, handler: (payload: T) => void): void {
+      registrations.push(listen<T>(name, whenCommitted(handler)));
+    }
 
-    registrations.push(
-      listen<{
-        account_id: string;
-        folder: string;
-        synced: number;
-        total_folders: number;
-        current_folder: number;
-      }>(
-        "sync-progress",
-        whenCommitted((event) => {
-          const p = event.payload;
-          updateOperation(
-            `sync-${p.account_id}`,
-            `${p.folder} (${p.current_folder}/${p.total_folders})${p.synced > 0 ? ` - ${p.synced} new` : ""}`,
-          );
-        }),
-      ),
-    );
+    register<SyncStartedPayload>("sync-started", (payload) => {
+      startOperation(
+        mailSyncOperationId(payload.account_id),
+        "sync",
+        `Syncing ${payload.account_name}`,
+        "Syncing...",
+      );
+    });
 
-    registrations.push(
-      listen<{ account_id: string; total_synced: number }>(
-        "sync-complete",
-        whenCommitted((event) => {
-          const p = event.payload;
-          completeOperation(
-            `sync-${p.account_id}`,
-            p.total_synced > 0
-              ? `Done - ${p.total_synced} new messages`
-              : "Up to date",
-          );
-        }),
-      ),
-    );
+    register<SyncProgressPayload>("sync-progress", (payload) => {
+      const newMessages = payload.synced > 0 ? ` - ${payload.synced} new` : "";
+      updateOperation(
+        mailSyncOperationId(payload.account_id),
+        `${payload.folder} (${payload.current_folder}/${payload.total_folders})${newMessages}`,
+      );
+    });
 
-    registrations.push(
-      listen<{ account_id: string; error: string }>(
-        "sync-error",
-        whenCommitted((event) => {
-          failOperation(`sync-${event.payload.account_id}`, event.payload.error);
-        }),
-      ),
-    );
+    register<SyncCompletePayload>("sync-complete", (payload) => {
+      completeOperation(
+        mailSyncOperationId(payload.account_id),
+        payload.total_synced > 0
+          ? `Done - ${payload.total_synced} new messages`
+          : "Up to date",
+      );
+    });
 
-    // --- Calendar sync events ---
-    // Dedicated start/complete/error events, mirroring the mail
-    // `sync-started`/`sync-complete`/`sync-error` triad. We deliberately do
-    // NOT listen for `calendar-changed`: that event also fires from invite
-    // responses, push processing, and other non-sync mutations, so coupling
-    // it to the spinner would complete the indicator prematurely.
-    registrations.push(
-      listen<string>(
-        "calendar-sync-started",
-        whenCommitted((event) => {
-          startOperation(
-            `cal-sync-${event.payload}`,
-            "sync",
-            "Syncing calendars",
-            "Syncing...",
-          );
-        }),
-      ),
-    );
-    registrations.push(
-      listen<string>(
-        "calendar-sync-complete",
-        whenCommitted((event) => {
-          completeOperation(`cal-sync-${event.payload}`, "Calendars updated");
-        }),
-      ),
-    );
-    registrations.push(
-      listen<{ account_id: string; error: string }>(
-        "calendar-sync-error",
-        whenCommitted((event) => {
-          failOperation(
-            `cal-sync-${event.payload.account_id}`,
-            event.payload.error,
-          );
-        }),
-      ),
-    );
+    register<AccountErrorPayload>("sync-error", (payload) => {
+      failOperation(mailSyncOperationId(payload.account_id), payload.error);
+    });
 
-    // --- Contacts sync events ---
-    registrations.push(
-      listen<string>(
-        "contacts-changed",
-        whenCommitted((event) => {
-          completeOperation(
-            `contacts-sync-${event.payload}`,
-            "Contacts updated",
-          );
-        }),
-      ),
-    );
+    // calendar-changed includes non-sync mutations and must not drive the spinner.
+    register<string>("calendar-sync-started", (accountId) => {
+      startOperation(
+        calendarSyncOperationId(accountId),
+        "sync",
+        "Syncing calendars",
+        "Syncing...",
+      );
+    });
 
-    // --- Background operation failures ---
-    registrations.push(
-      listen<{ account_id: string; op_type: string; error: string }>(
-        "op-failed",
-        whenCommitted((event) => {
-          const p = event.payload;
-          // Create and immediately fail an operation entry so it shows up in the
-          // operations panel (failOperation is a no-op for unknown ids).
-          const opId = `op-${p.account_id}-${Date.now()}`;
-          startOperation(opId, "general", `${p.op_type} failed`, p.error);
-          failOperation(opId, `${p.op_type}: ${p.error}`);
-        }),
-      ),
-    );
+    register<string>("calendar-sync-complete", (accountId) => {
+      completeOperation(calendarSyncOperationId(accountId), "Calendars updated");
+    });
 
-    // --- Send events ---
-    registrations.push(
-      listen<{ account_id: string; subject: string; outbox_id: number }>(
-        "send-started",
-        whenCommitted((event) => {
-          const p = event.payload;
-          const opId = `send-${p.outbox_id}`;
-          startOperation(opId, "send", `Sending "${p.subject}"`, "Syncing...");
-          const toastId = showToast(`Sending "${p.subject}"...`, "info", 0); // persistent until complete/failed
-          sendToastIds.set(opId, toastId);
-        }),
-      ),
-    );
+    register<AccountErrorPayload>("calendar-sync-error", (payload) => {
+      failOperation(
+        calendarSyncOperationId(payload.account_id),
+        payload.error,
+      );
+    });
 
-    registrations.push(
-      listen<{ account_id: string; subject: string; outbox_id: number }>(
-        "send-complete",
-        whenCommitted((event) => {
-          const p = event.payload;
-          const opId = `send-${p.outbox_id}`;
-          completeOperation(opId, "Sent");
-          dismissSendToast(opId);
-          showToast(`"${p.subject}" sent`, "success");
-        }),
-      ),
-    );
+    register<OperationFailurePayload>("op-failed", (payload) => {
+      // failOperation ignores unknown IDs, so create the visible entry first.
+      const operationId = `op-${payload.account_id}-${Date.now()}`;
+      startOperation(
+        operationId,
+        "general",
+        `${payload.op_type} failed`,
+        payload.error,
+      );
+      failOperation(operationId, `${payload.op_type}: ${payload.error}`);
+    });
 
-    registrations.push(
-      listen<{
-        account_id: string;
-        subject: string;
-        outbox_id: number;
-        error: string;
-      }>(
-        "send-failed",
-        whenCommitted((event) => {
-          const p = event.payload;
-          const opId = `send-${p.outbox_id}`;
-          failOperation(opId, p.error);
-          dismissSendToast(opId);
-          showToast(`Send failed: ${p.error}`, "error", 10000);
-        }),
-      ),
-    );
+    register<SendPayload>("send-started", (payload) => {
+      const operationId = sendOperationId(payload.outbox_id);
+      startOperation(
+        operationId,
+        "send",
+        `Sending "${payload.subject}"`,
+        "Syncing...",
+      );
+      const toastId = showToast(`Sending "${payload.subject}"...`, "info", 0);
+      sendToastIds.set(operationId, toastId);
+    });
 
-    registrations.push(
-      listen<{
-        account_id: string;
-        subject: string;
-        outbox_id: number;
-        error: string;
-      }>(
-        "send-unknown",
-        whenCommitted((event) => {
-          const p = event.payload;
-          const opId = `send-${p.outbox_id}`;
-          const detail = `Delivery status unknown: ${p.error}`;
-          failOperation(opId, detail);
-          dismissSendToast(opId);
-          showToast(
-            `Delivery status unknown for "${p.subject}": ${p.error}`,
-            "error",
-            10000,
-          );
-        }),
-      ),
-    );
+    register<SendPayload>("send-complete", (payload) => {
+      const operationId = sendOperationId(payload.outbox_id);
+      completeOperation(operationId, "Sent");
+      dismissSendToast(operationId);
+      showToast(`"${payload.subject}" sent`, "success");
+    });
+
+    register<SendFailurePayload>("send-failed", (payload) => {
+      const operationId = sendOperationId(payload.outbox_id);
+      failOperation(operationId, payload.error);
+      dismissSendToast(operationId);
+      showToast(
+        `Send failed: ${payload.error}`,
+        "error",
+        SEND_FAILURE_TOAST_DURATION_MS,
+      );
+    });
+
+    register<SendFailurePayload>("send-unknown", (payload) => {
+      const operationId = sendOperationId(payload.outbox_id);
+      const detail = `Delivery status unknown: ${payload.error}`;
+      failOperation(operationId, detail);
+      dismissSendToast(operationId);
+      showToast(
+        `Delivery status unknown for "${payload.subject}": ${payload.error}`,
+        "error",
+        SEND_FAILURE_TOAST_DURATION_MS,
+      );
+    });
 
     let listeners: UnlistenFn[];
     try {
@@ -467,8 +449,6 @@ export const useActivityStore = defineStore("activity", () => {
     for (const cleanup of [...pendingRegistrationCleanups]) cleanup();
     for (const toastId of sendToastIds.values()) dismissToast(toastId);
     sendToastIds.clear();
-    // Cancel any pending removal timers so they don't fire on a disposed
-    // store and mutate state (or leak the handle).
     for (const handle of pendingRemovals.values()) {
       clearTimeout(handle);
     }
@@ -480,10 +460,6 @@ export const useActivityStore = defineStore("activity", () => {
     activeOperations,
     recentOperations,
     hasActiveOperations,
-    startOperation,
-    updateOperation,
-    completeOperation,
-    failOperation,
     initEventListeners,
   };
 });
