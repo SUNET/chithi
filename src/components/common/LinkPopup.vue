@@ -14,17 +14,14 @@ const original = computed(() => uiStore.linkPopupUrl);
 const wasModified = computed(
   () => cleaned.value !== null && original.value !== null && cleaned.value !== original.value,
 );
-// Mirror src-tauri/src/commands/links.rs::ALLOWED_SCHEMES. Schemes are
-// case-insensitive per RFC 3986 §3.1, so compare lowercased.
+// Keep schemes aligned with the backend allowlist.
 const OPENABLE_SCHEMES = ["http://", "https://", "mailto:", "tel:"];
 const openableScheme = computed(() => {
-  const u = (original.value ?? "").slice(0, 8).toLowerCase();
-  return OPENABLE_SCHEMES.some((s) => u.startsWith(s));
+  const prefix = (original.value ?? "").slice(0, 8).toLowerCase();
+  return OPENABLE_SCHEMES.some((scheme) => prefix.startsWith(scheme));
 });
 
-// Fetch the cleaned form whenever a new URL is shown. The Tauri command
-// returns the original string unchanged if no tracking was found, so
-// `wasModified` reliably tells us whether to surface the diff in the UI.
+// An unchanged result means no tracking parameters were found.
 watch(
   () => uiStore.linkPopupUrl,
   async (url) => {
@@ -35,9 +32,7 @@ watch(
     try {
       cleaned.value = await api.cleanUrl(url);
     } catch {
-      // Preserve the original so Open still has a sensible argument, but
-      // surface the failure to the user instead of silently claiming the
-      // URL is clean.
+      // Preserve a usable URL while surfacing the cleaning failure.
       cleaned.value = url;
       cleanError.value = true;
     } finally {
@@ -52,8 +47,8 @@ async function onCopy() {
   try {
     await navigator.clipboard.writeText(original.value);
     showToast("Link copied to clipboard", "success");
-  } catch (e) {
-    showToast("Copy failed: " + String(e), "error");
+  } catch (error) {
+    showToast("Copy failed: " + String(error), "error");
   }
   uiStore.closeLinkPopup();
 }
@@ -61,12 +56,10 @@ async function onCopy() {
 async function onOpen() {
   if (!original.value) return;
   try {
-    // The Rust side re-sanitizes, so we pass the original and let the
-    // backend strip again. Avoids any drift between the preview and the
-    // URL actually opened.
+    // The backend re-sanitizes the original before opening it.
     await api.openLink(original.value);
-  } catch (e) {
-    showToast("Open failed: " + String(e), "error");
+  } catch (error) {
+    showToast("Open failed: " + String(error), "error");
   }
   uiStore.closeLinkPopup();
 }
@@ -75,10 +68,10 @@ function onCancel() {
   uiStore.closeLinkPopup();
 }
 
-function onKeydown(e: KeyboardEvent) {
+function onKeydown(event: KeyboardEvent) {
   if (!uiStore.linkPopupUrl) return;
-  if (e.key === "Escape") {
-    e.preventDefault();
+  if (event.key === "Escape") {
+    event.preventDefault();
     onCancel();
   }
 }
