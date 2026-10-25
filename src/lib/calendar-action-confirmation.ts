@@ -1,9 +1,30 @@
 import { message as tauriMessage } from "@tauri-apps/plugin-dialog";
 import type {
-  CalendarActionPlan, CalendarConfirmations,
+  CalendarActionPlan,
+  CalendarConfirmations,
 } from "./types";
 
-/** Collect every confirmation required by a persisted calendar action plan. */
+function matchesDialogAnswer(
+  answer: string,
+  label: string,
+  fallback: string,
+): boolean {
+  return answer === label || answer === fallback;
+}
+
+async function confirmWarning(
+  message: string,
+  title: string,
+  confirmLabel: string,
+): Promise<boolean> {
+  const answer = await tauriMessage(message, {
+    title,
+    kind: "warning",
+    buttons: { ok: confirmLabel, cancel: "Cancel" },
+  });
+  return matchesDialogAnswer(answer, confirmLabel, "Ok");
+}
+
 export async function confirmCalendarAction(
   plan: CalendarActionPlan,
   options: { confirmSeriesMove?: boolean } = {},
@@ -13,48 +34,39 @@ export async function confirmCalendarAction(
     reset_exceptions: false,
   };
   if (options.confirmSeriesMove || plan.requires.replacement_meeting_identity) {
-    const answer = await tauriMessage(
+    const confirmed = await confirmWarning(
       plan.requires.replacement_meeting_identity
         ? "Moving this recurring meeting creates a replacement meeting identity in the destination calendar. Move the entire series?"
         : "Move the entire recurring series to the destination calendar?",
-      {
-        title: "Move Recurring Meeting",
-        kind: "warning",
-        buttons: { ok: "Move Series", cancel: "Cancel" },
-      },
+      "Move Recurring Meeting",
+      "Move Series",
     );
-    if (answer !== "Move Series" && answer !== "Ok") return null;
+    if (!confirmed) return null;
     confirmations.replacement_meeting_identity =
       plan.requires.replacement_meeting_identity;
   }
   if (plan.requires.reset_exceptions) {
-    const answer = await tauriMessage(
+    const confirmed = await confirmWarning(
       "This recurrence change removes existing exceptions. Continue?",
-      {
-        title: "Reset Recurring Exceptions",
-        kind: "warning",
-        buttons: { ok: "Reset Exceptions", cancel: "Cancel" },
-      },
+      "Reset Recurring Exceptions",
+      "Reset Exceptions",
     );
-    if (answer !== "Reset Exceptions" && answer !== "Ok") return null;
+    if (!confirmed) return null;
     confirmations.reset_exceptions = true;
   }
   return confirmations;
 }
 
 export async function chooseRescheduleScope(
-  allowOccurrence: boolean,
+  allowSingleOccurrence: boolean,
 ): Promise<"this-occurrence" | "entire-series" | null> {
-  if (!allowOccurrence) {
-    const answer = await tauriMessage(
+  if (!allowSingleOccurrence) {
+    const confirmed = await confirmWarning(
       "Reschedule the entire recurring series?",
-      {
-        title: "Reschedule Recurring Event",
-        kind: "warning",
-        buttons: { ok: "Entire Series", cancel: "Cancel" },
-      },
+      "Reschedule Recurring Event",
+      "Entire Series",
     );
-    return answer === "Entire Series" || answer === "Ok" ? "entire-series" : null;
+    return confirmed ? "entire-series" : null;
   }
   const answer = await tauriMessage(
     "Apply this new time to only this occurrence or to the entire series?",
@@ -68,7 +80,11 @@ export async function chooseRescheduleScope(
       },
     },
   );
-  if (answer === "This Occurrence" || answer === "Yes") return "this-occurrence";
-  if (answer === "Entire Series" || answer === "No") return "entire-series";
+  if (matchesDialogAnswer(answer, "This Occurrence", "Yes")) {
+    return "this-occurrence";
+  }
+  if (matchesDialogAnswer(answer, "Entire Series", "No")) {
+    return "entire-series";
+  }
   return null;
 }
