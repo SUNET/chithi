@@ -3,73 +3,62 @@ import { computed, ref } from "vue";
 import type { Account, AccountConfig } from "@/lib/types";
 import * as api from "@/lib/tauri";
 
+function hasMailBinding(account: Account): boolean {
+  return account.mail_protocol !== "";
+}
+
 export const useAccountsStore = defineStore("accounts", () => {
   const accounts = ref<Account[]>([]);
   const activeAccountId = ref<string | null>(null);
   const loading = ref(false);
 
   const activeAccount = () =>
-    accounts.value.find((a) => a.id === activeAccountId.value) ?? null;
+    accounts.value.find((account) => account.id === activeAccountId.value) ??
+    null;
 
-  // Phase 4 (#43): standalone CalDAV / CardDAV / JMAP-cal-only accounts
-  // surface with `mail_protocol === ""`. Mail screens iterate this
-  // getter so they don't try to list folders for an account that has no
-  // mail backend.
   const mailAccounts = computed(() =>
-    accounts.value.filter((a) => a.mail_protocol !== ""),
+    accounts.value.filter(hasMailBinding),
   );
 
-  // On startup `fetchAccounts()` is called concurrently from the router
-  // guard, App.vue and MailView. Without de-duplication the guard could
-  // observe `accounts.length === 0` while another call is still in flight
-  // and wrongly redirect to onboarding. Sharing one in-flight promise
-  // makes every caller await the same result.
+  // Startup callers share one load so guards cannot observe a partial state.
   let inFlight: Promise<void> | null = null;
 
-  // #191: on cold start (no active account yet), prefer the account the
-  // user was last viewing over the alphabetically-first one. Falls back
-  // to the first enabled account with a mail backend — calendar-/
-  // contacts-only accounts (#43) have no folders to show in Mail — and
-  // finally to today's plain "first account" behavior if none qualify.
-  // The restore is mail-protocol-gated too: FiltersView's account picker
-  // (unlike Mail's) lists every account and shares this same
-  // activeAccountId, so a calendar-/contacts-only id could in principle
-  // end up persisted — restoring into one would leave Mail empty.
+  // Restoring a non-mail account would leave the Mail view unusable.
   async function resolveInitialAccountId(): Promise<string> {
     try {
       const lastView = await api.getLastView();
       if (lastView.account_id) {
         const restored = accounts.value.find(
-          (a) =>
-            a.id === lastView.account_id &&
-            a.enabled &&
-            a.mail_protocol !== "",
+          (account) =>
+            account.id === lastView.account_id &&
+            account.enabled &&
+            hasMailBinding(account),
         );
         if (restored) return restored.id;
       }
-    } catch (e) {
-      console.error("Failed to load last view:", e);
+    } catch (error) {
+      console.error("Failed to load last view:", error);
     }
     const firstEnabledMail = accounts.value.find(
-      (a) => a.mail_protocol !== "" && a.enabled,
+      (account) => hasMailBinding(account) && account.enabled,
     );
     return (firstEnabledMail ?? accounts.value[0]).id;
   }
 
-  async function fetchAccounts(): Promise<void> {
+  async function loadAccounts(): Promise<void> {
+    accounts.value = await api.listAccounts();
+    if (accounts.value.length > 0 && !activeAccountId.value) {
+      activeAccountId.value = await resolveInitialAccountId();
+    }
+  }
+
+  function fetchAccounts(): Promise<void> {
     if (inFlight) return inFlight;
     loading.value = true;
-    inFlight = (async () => {
-      try {
-        accounts.value = await api.listAccounts();
-        if (accounts.value.length > 0 && !activeAccountId.value) {
-          activeAccountId.value = await resolveInitialAccountId();
-        }
-      } finally {
-        loading.value = false;
-        inFlight = null;
-      }
-    })();
+    inFlight = loadAccounts().finally(() => {
+      loading.value = false;
+      inFlight = null;
+    });
     return inFlight;
   }
 
@@ -78,25 +67,32 @@ export const useAccountsStore = defineStore("accounts", () => {
     localStorage.removeItem("chithi-onboarding-skipped");
     await fetchAccounts();
     activeAccountId.value = id;
-    // Auto-trigger sync for the new account (fire and forget)
-    api.triggerSync(id).catch((e) => console.error("Initial sync failed:", e));
+    void api
+      .triggerSync(id)
+      .catch((error) => console.error("Initial sync failed:", error));
     return id;
   }
 
-  async function deleteAccount(id: string) {
-    await api.deleteAccount(id);
+  async function removeAccount(
+    id: string,
+    remove: () => Promise<void>,
+  ): Promise<void> {
+    await remove();
     if (activeAccountId.value === id) {
       activeAccountId.value = null;
     }
     await fetchAccounts();
   }
 
-  async function abandonZoomAccount(id: string, confirmation: string) {
-    await api.abandonZoomAccount(id, confirmation);
-    if (activeAccountId.value === id) {
-      activeAccountId.value = null;
-    }
-    await fetchAccounts();
+  function deleteAccount(id: string): Promise<void> {
+    return removeAccount(id, () => api.deleteAccount(id));
+  }
+
+  function abandonZoomAccount(
+    id: string,
+    confirmation: string,
+  ): Promise<void> {
+    return removeAccount(id, () => api.abandonZoomAccount(id, confirmation));
   }
 
   function setActiveAccount(id: string) {
