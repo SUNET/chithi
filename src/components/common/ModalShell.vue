@@ -1,10 +1,6 @@
 <script setup lang="ts">
-/// Shared modal chrome for the settings modals: teleported overlay,
-/// centered card, header with title + close button, body slot and
-/// optional footer slot. Carries the settings look (including the
-/// mobile sheet presentation) — the contacts modals keep their own
-/// slightly different chrome.
-defineProps<{ open: boolean; title?: string; modalClass?: string }>();
+defineOptions({ inheritAttrs: false });
+defineProps<{ open: boolean; title: string; modalClass?: string }>();
 const emit = defineEmits<{ close: [] }>();
 </script>
 
@@ -27,16 +23,10 @@ const emit = defineEmits<{ close: [] }>();
   </Teleport>
 </template>
 
-<script lang="ts">
-// The modal card must receive data-testid etc. from consumers, not
-// the overlay div.
-export default { inheritAttrs: false };
-</script>
-
 <style scoped>
 .modal-overlay {
   position: fixed;
-  top: 0; left: 0; right: 0; bottom: 0;
+  inset: 0;
   background: rgba(0, 0, 0, 0.2);
   display: flex;
   align-items: center;
@@ -52,14 +42,6 @@ export default { inheritAttrs: false };
   max-height: 85vh;
   overflow-y: auto;
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.12);
-}
-
-.modal-sm {
-  width: 400px;
-}
-
-.modal-picker {
-  max-width: 600px;
 }
 
 .modal-header {
@@ -81,9 +63,8 @@ export default { inheritAttrs: false };
   width: 28px;
   height: 28px;
   border-radius: 6px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
 }
 
 .modal-close:hover {
@@ -103,9 +84,6 @@ export default { inheritAttrs: false };
   border-top: 1px solid var(--color-border);
 }
 
-/* ============================================================
-   Sheet presentation on mobile (§13)
-   ============================================================ */
 @media (max-width: 720px) {
   .modal-overlay {
     align-items: flex-end;
@@ -117,15 +95,11 @@ export default { inheritAttrs: false };
     max-width: 100%;
     height: calc(100vh - 48px);
     max-height: calc(100vh - 48px);
-    border-bottom-left-radius: 0;
-    border-bottom-right-radius: 0;
-    border-top-left-radius: var(--radius-sheet, 16px);
-    border-top-right-radius: var(--radius-sheet, 16px);
+    border-radius: var(--radius-sheet, 16px) var(--radius-sheet, 16px) 0 0;
     box-shadow: var(--shadow-sheet, 0 -12px 30px rgba(30, 20, 10, 0.18));
     position: relative;
   }
 
-  /* Grabber at the top of the sheet. */
   .modal::before {
     content: "";
     display: block;
@@ -134,7 +108,6 @@ export default { inheritAttrs: false };
     border-radius: 100px;
     background: var(--color-border);
     margin: 8px auto 4px;
-    flex-shrink: 0;
   }
 
   .modal-header {
@@ -144,7 +117,6 @@ export default { inheritAttrs: false };
 
   .modal-header h3 {
     font-size: 15px;
-    font-weight: 600;
     flex: 1;
     text-align: center;
   }
