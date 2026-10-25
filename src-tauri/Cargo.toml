@@ -18,7 +18,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-os = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 imap = "2"
 imap-proto = "0.10"
@@ -32,7 +32,7 @@ rrule = { version = "0.14", default-features = false }
 iana-time-zone = "0.1"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
-ammonia = "4.1.7"
+ammonia = "4.1.8"
 async-trait = "0.1.92"
 log = "0.4"
 fern = { version = "0.7", features = ["date-based"] }

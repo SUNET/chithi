@@ -1,62 +1,60 @@
 [advisories]
-# Each ignored advisory must also be tracked in the GitHub tracking issue for
-# upstream-blocked RUSTSEC advisories. When an upstream fix ships (e.g. Tauri
-# migrates wry to webkit6gtk, or a transitive dep bumps a nom/rand version),
-# remove the entry and let CI flag any regression.
+# Track every exception at https://github.com/SUNET/chithi/issues/103 with its
+# dependency path, exposure, and removal condition. Remove exceptions as soon
+# as the dependency is fixed or removed, or the advisory is withdrawn.
+# Run from the repository root so cargo-audit loads this configuration:
+#   cargo audit --file src-tauri/Cargo.lock --deny warnings
 ignore = [
-    # --- gtk-rs GTK3 bindings, unmaintained. Transitive via
-    # tauri -> wry -> webkit2gtk / gtk 0.18. Blocked on Tauri/wry migrating
-    # off GTK3; there is no GTK3 fork we can swap in.
-    "RUSTSEC-2024-0411", # gdkwayland-sys
-    "RUSTSEC-2024-0412", # gdk
-    "RUSTSEC-2024-0413", # atk
-    "RUSTSEC-2024-0414", # gdkx11-sys
-    "RUSTSEC-2024-0415", # gtk
-    "RUSTSEC-2024-0416", # atk-sys
-    "RUSTSEC-2024-0417", # gdkx11
-    "RUSTSEC-2024-0418", # gdk-sys
-    "RUSTSEC-2024-0419", # gtk3-macros
-    "RUSTSEC-2024-0420", # gtk-sys
-    "RUSTSEC-2024-0429", # glib::VariantStrIter unsoundness (gtk-rs family)
+    # --- GTK3 runtime and build-time dependencies, via
+    # tauri -> wry/webkit2gtk -> gtk/glib 0.18. Chithi does not directly use
+    # VariantStrIter; proc-macro-error only runs during compilation. Remove
+    # when Tauri's GTK stack uses fixed glib (>=0.20) and maintained macros.
+    # Upstream: https://github.com/tauri-apps/wry/issues/1474
+    # The GTK3 maintenance advisories 2024-0411..0420 were withdrawn on
+    # 2026-08-14 and no longer need exceptions.
+    "RUSTSEC-2024-0429", # glib::VariantStrIter unsoundness
+    "RUSTSEC-2024-0370", # proc-macro-error
 
-    # --- transitive unmaintained deps pulled in by upstream crates
-    "RUSTSEC-2024-0370", # proc-macro-error, via multiple build-time macro crates
-    "RUSTSEC-2025-0075", # unic-char-range, via idna_adapter
+    # --- unmaintained Unicode tables, via tauri-utils -> urlpattern 0.3.
+    # No concrete exploit is identified by these maintenance advisories.
+    # Remove when Tauri updates/replaces urlpattern with a unic-free version.
+    "RUSTSEC-2025-0075", # unic-char-range
     "RUSTSEC-2025-0080", # unic-common
     "RUSTSEC-2025-0081", # unic-char-property
     "RUSTSEC-2025-0098", # unic-ucd-version
     "RUSTSEC-2025-0100", # unic-ucd-ident
 
-    # --- soundness in transitive deps, not exploitable in our threat model
-    "RUSTSEC-2023-0086", # lexical-core 0.7.6, via imap 2.x -> nom 5. The
-                        # unsound float parser is not reached by IMAP parsing
-                        # (no floats). A future migration to imap 3.x would
-                        # drop this transitively.
+    # --- IMAP parser soundness: imap 2.4 / direct imap-proto 0.10 -> nom 5
+    # -> lexical-core 0.7.6. The IMAP parsers do not use nom's float parsers,
+    # which call lexical-core. Remove after migrating BOTH IMAP dependencies
+    # off nom 5 (also tracked in #267); imap 3 is still an alpha release.
+    "RUSTSEC-2023-0086",
 
     # --- cryptographic timing side-channel, no upstream fix available
-    "RUSTSEC-2023-0071", # rsa "Marvin Attack": potential RSA key recovery
-                        # through a timing side-channel. Transitive via the
-                        # OpenPGP stack (libtumpa -> rpgp -> rsa). No
-                        # constant-time `rsa` release exists yet. The attack
-                        # needs an adversary to time many RSA private-key
-                        # operations, in practice over a network; Chithi
-                        # decrypts locally on explicit user action and
-                        # exposes no network-reachable RSA oracle, so the
-                        # practical exposure is minimal. Drop this once
-                        # `rsa` ships a constant-time release.
-                        # Upstream: https://github.com/RustCrypto/RSA/issues/19
+    # libtumpa -> pgp / wecanencrypt -> rsa 0.9.10. Private-key operations
+    # run locally on user action, without a network-reachable timing oracle;
+    # this does not rule out local side channels. No patched rsa release is
+    # listed by RustSec. Remove once the OpenPGP stack adopts a fixed release.
+    # Upstream: https://github.com/RustCrypto/RSA/issues/626
+    "RUSTSEC-2023-0071",
 
-    # --- quick-xml < 0.41 DoS on untrusted XML, both copies transitive via
-    # the Tauri toolchain and un-bumpable without a new Tauri release:
-    #   quick-xml 0.39.4 <- plist <- tauri-utils (config / macOS bundling)
-    #   quick-xml 0.37.5 <- tauri-winrt-notification <- notify-rust
-    #                       <- tauri-plugin-notification (Windows toasts)
-    # 0.41 is a semver-major bump the parents pin below; Tauri 2.11.2 is
-    # the latest 2.x, so there is no compatible bump for us to take.
-    # Neither path parses attacker-supplied XML in Chithi (local Info.plist
-    # / self-generated toast XML), so the DoS is not reachable in our
-    # threat model. Drop when a Tauri release moves plist / notify-rust to
-    # a quick-xml 0.41 line.
-    "RUSTSEC-2026-0194", # quick-xml quadratic dup-attribute check (CPU DoS)
-    "RUSTSEC-2026-0195", # quick-xml unbounded namespace-decl alloc (mem DoS)
+    # --- OpenPGP integer-arithmetic timing side channels (#341).
+    # libtumpa -> pgp / wecanencrypt -> elliptic-curve 0.13 / cx448 0.1
+    # -> crypto-bigint 0.5.5. Fixed in >=0.7.6, outside the parents' semver
+    # requirements (including current pgp 0.21 and wecanencrypt 0.16.3).
+    # Local user-triggered crypto reduces remote exposure but secret-key
+    # leakage remains possible if an attacker can observe side channels.
+    # Remove once ALL OpenPGP paths adopt crypto-bigint >=0.7.6.
+    # Upstream: https://github.com/RustCrypto/crypto-bigint/pull/1365
+    "RUSTSEC-2026-0387",
+
+    # --- D-Bus crates merged into zbus 6 (#335, #336, #337).
+    # tauri-plugin-opener -> zbus 5, and tauri-plugin-notification ->
+    # notify-rust -> zbus 5 -> these crates. No reported exploit.
+    # Even notify-rust 4.18.2 and stable tauri-plugin-opener 2.5.4 use zbus 5.
+    # Remove when both plugin paths migrate to zbus >=6 and drop the crates.
+    # Upstream: https://github.com/z-galaxy/zbus/issues/2043
+    "RUSTSEC-2026-0370", # zvariant
+    "RUSTSEC-2026-0371", # zbus_names
+    "RUSTSEC-2026-0372", # zvariant_derive
 ]

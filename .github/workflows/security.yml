@@ -8,6 +8,7 @@ on:
     paths:
       - "src-tauri/Cargo.toml"
       - "src-tauri/Cargo.lock"
+      - ".cargo/audit.toml"
       - ".github/workflows/security.yml"
   workflow_dispatch:
 
