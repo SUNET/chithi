@@ -1,8 +1,4 @@
 <script setup lang="ts">
-/// Left pane of the desktop contacts view: the address-book list.
-/// Pure presentation — data ownership (fetching, selection state,
-/// sync) stays in ContactsView. The root keeps the `books-sidebar`
-/// class so the view's layout rules still size it.
 import { useAccountsStore } from "@/stores/accounts";
 import type { ContactBook } from "@/lib/types";
 import { acctColor } from "@/lib/account-colors";
@@ -16,7 +12,12 @@ const emit = defineEmits<{ select: [bookId: string] }>();
 const accountsStore = useAccountsStore();
 
 function getAccountName(accountId: string): string {
-  return accountsStore.accounts.find((a) => a.id === accountId)?.display_name ?? "";
+  return accountsStore.accounts.find((account) => account.id === accountId)?.display_name ?? "";
+}
+
+function avatarStyle(accountId: string) {
+  const { fill, soft } = acctColor(accountId);
+  return { background: soft, color: fill, boxShadow: `inset 0 0 0 1.5px ${fill}` };
 }
 </script>
 
@@ -32,11 +33,7 @@ function getAccountName(accountId: string): string {
     >
       <span
         class="book-avatar"
-        :style="{
-          background: acctColor(book.account_id).soft,
-          color: acctColor(book.account_id).fill,
-          boxShadow: 'inset 0 0 0 1.5px ' + acctColor(book.account_id).fill,
-        }"
+        :style="avatarStyle(book.account_id)"
       >
         {{ book.name.charAt(0).toUpperCase() }}
       </span>
@@ -51,9 +48,6 @@ function getAccountName(accountId: string): string {
 </template>
 
 <style scoped>
-/* Inner items get the indent that used to live on .books-sidebar so
-   the .app-sidebar-header above sits flush with the toolbar's left
-   edge instead of being pushed in 8px from the container. (#150) */
 .books-sidebar .book-item,
 .books-sidebar .empty-text {
   margin: 0 8px;
@@ -83,9 +77,8 @@ function getAccountName(accountId: string): string {
   width: 30px;
   height: 30px;
   border-radius: 50%;
-  display: flex;
-  align-items: center;
-  justify-content: center;
+  display: grid;
+  place-items: center;
   font-size: 11px;
   font-weight: 700;
   flex-shrink: 0;
