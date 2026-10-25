@@ -573,12 +573,6 @@ export interface FailedOp {
   timestamp: number;
 }
 
-export interface OfflineQueueChange {
-  account_id: string;
-  dead_op_id: number;
-  action_type: string;
-}
-
 /** Invalid as an IMAP/JMAP mailbox name, preventing remote-folder collisions. */
 export const OUTBOX_FOLDER = "__chithi_outbox__";
 
