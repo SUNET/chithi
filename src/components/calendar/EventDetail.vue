@@ -4,6 +4,7 @@ import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { formatInTimezone, getDateInTimezone, toTimeInTimezone, localInputToUTC } from "@/lib/datetime";
+import { addCalendarDays, parseCalendarDay } from "@/lib/calendar-days";
 import {
   calendarEditSupport, calendarMutationSupport, calendarScopedEditSupport,
 } from "@/lib/calendar-mutation-support";
@@ -122,6 +123,11 @@ function calendarLabel(calendar: Calendar): string {
 }
 
 function formatDateTime(iso: string): string {
+  if (event.value?.all_day) {
+    return parseCalendarDay(iso).toLocaleDateString(undefined, {
+      weekday: "long", month: "long", day: "numeric", year: "numeric",
+    });
+  }
   return formatInTimezone(iso, uiStore.displayTimezone, { hour12: uiStore.hour12 });
 }
 
@@ -148,9 +154,15 @@ function startEditing() {
   const current = event.value;
   editTitle.value = current.title;
   editStartDate.value = getDateInTimezone(current.start_time, uiStore.displayTimezone);
-  editStartTime.value = toTimeInTimezone(new Date(current.start_time), uiStore.displayTimezone);
-  editEndDate.value = getDateInTimezone(current.end_time, uiStore.displayTimezone);
-  editEndTime.value = toTimeInTimezone(new Date(current.end_time), uiStore.displayTimezone);
+  editStartTime.value = current.all_day
+    ? "00:00"
+    : toTimeInTimezone(new Date(current.start_time), uiStore.displayTimezone);
+  editEndDate.value = current.all_day
+    ? addCalendarDays(current.end_time, -1)
+    : getDateInTimezone(current.end_time, uiStore.displayTimezone);
+  editEndTime.value = current.all_day
+    ? "23:59"
+    : toTimeInTimezone(new Date(current.end_time), uiStore.displayTimezone);
   editAllDay.value = current.all_day;
   editLocation.value = current.location || "";
   editDescription.value = current.description || "";
@@ -187,12 +199,11 @@ async function saveEdit() {
   try {
     const occurrenceEdit = editScope.value === "this-occurrence";
     const entireSeriesEdit = editScope.value === "entire-series";
-    const recurringEdit = occurrenceEdit || entireSeriesEdit;
     const startISO = editAllDay.value
-      ? recurringEdit ? editStartDate.value : `${editStartDate.value}T00:00:00Z`
+      ? editStartDate.value
       : localInputToUTC(editStartDate.value, editStartTime.value, uiStore.displayTimezone);
     const endISO = editAllDay.value
-      ? recurringEdit ? editEndDate.value : `${editEndDate.value}T23:59:59Z`
+      ? addCalendarDays(editEndDate.value, 1)
       : localInputToUTC(editEndDate.value, editEndTime.value, uiStore.displayTimezone);
 
     if (occurrenceEdit) {

@@ -4,6 +4,7 @@ import { useCalendarStore } from "@/stores/calendar";
 import { useAccountsStore } from "@/stores/accounts";
 import { useUiStore } from "@/stores/ui";
 import { localInputToUTC, toDateInTimezone, toTimeInTimezone } from "@/lib/datetime";
+import { addCalendarDays } from "@/lib/calendar-days";
 import * as api from "@/lib/tauri";
 import RecurrenceEditor from "./RecurrenceEditor.vue";
 import AttendeeEditor from "./AttendeeEditor.vue";
@@ -144,6 +145,7 @@ const startDate = ref(toDateInTimezone(defaultStart, uiStore.displayTimezone));
 const startTime = ref(toTimeInTimezone(defaultStart, uiStore.displayTimezone));
 const endDate = ref(toDateInTimezone(defaultEnd, uiStore.displayTimezone));
 const endTime = ref(toTimeInTimezone(defaultEnd, uiStore.displayTimezone));
+const allDay = ref(false);
 
 const minEndTime = computed(() => {
   if (endDate.value === startDate.value) {
@@ -153,6 +155,10 @@ const minEndTime = computed(() => {
 });
 
 watch([startDate, startTime], () => {
+  if (allDay.value) {
+    if (endDate.value < startDate.value) endDate.value = startDate.value;
+    return;
+  }
   const sISO = localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
   const eISO = localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
   if (new Date(eISO) <= new Date(sISO)) {
@@ -161,7 +167,6 @@ watch([startDate, startTime], () => {
     endTime.value = toTimeInTimezone(newEnd, uiStore.displayTimezone);
   }
 });
-const allDay = ref(false);
 const location = ref("");
 const description = ref("");
 const calendarId = ref(calendarStore.calendars[0]?.id ?? "");
@@ -423,7 +428,12 @@ async function save() {
     return;
   }
 
-  if (!allDay.value) {
+  if (allDay.value) {
+    if (endDate.value < startDate.value) {
+      error.value = "End date must be on or after start date";
+      return;
+    }
+  } else {
     const sUTC = localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
     const eUTC = localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
     if (new Date(eUTC) <= new Date(sUTC)) {
@@ -444,10 +454,10 @@ async function save() {
     if (meetCreationPromise) await meetCreationPromise;
 
     const startISO = allDay.value
-      ? `${startDate.value}T00:00:00Z`
+      ? startDate.value
       : localInputToUTC(startDate.value, startTime.value, uiStore.displayTimezone);
     const endISO = allDay.value
-      ? `${endDate.value}T23:59:59Z`
+      ? addCalendarDays(endDate.value, 1)
       : localInputToUTC(endDate.value, endTime.value, uiStore.displayTimezone);
 
     if (

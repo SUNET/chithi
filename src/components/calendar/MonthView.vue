@@ -2,12 +2,7 @@
 import { computed, ref, onUnmounted } from "vue";
 import { useCalendarStore } from "@/stores/calendar";
 import { useUiStore } from "@/stores/ui";
-import {
-  getDateInTimezone,
-  getHourInTimezone,
-  getMinutesInTimezone,
-} from "@/lib/datetime";
-import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
+import { calendarDay, eventOccursOnDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
 import type { CalendarEvent } from "@/lib/types";
 import { dragCalendarEvent, isCalendarDragging, canDragCalendarEvent } from "@/lib/calendar-drag-state";
 
@@ -44,21 +39,8 @@ function isCurrentMonth(date: Date): boolean {
 
 function getEventsForDay(date: Date) {
   const dayStr = calendarDay(date);
-  return calendarStore.visibleEvents.filter((e) => {
-    const eStartDay = getDateInTimezone(e.start_time, uiStore.displayTimezone);
-    const eEndDay = getDateInTimezone(e.end_time, uiStore.displayTimezone);
-    if (eStartDay <= dayStr && eEndDay >= dayStr) {
-      if (e.all_day) return true;
-      // A midnight end is exclusive and belongs to the previous day.
-      if (eEndDay === dayStr) {
-        const endHour = getHourInTimezone(e.end_time, uiStore.displayTimezone);
-        const endMin = getMinutesInTimezone(e.end_time, uiStore.displayTimezone);
-        return endHour !== 0 || endMin !== 0;
-      }
-      return true;
-    }
-    return false;
-  });
+  return calendarStore.visibleEvents.filter((e) =>
+    eventOccursOnDay(e, dayStr, uiStore.displayTimezone));
 }
 
 function getEventColor(event: { calendar_id: string }): string {

@@ -11,7 +11,7 @@ import {
   endOfDayUTC,
 } from "@/lib/datetime";
 import type { CalendarEvent } from "@/lib/types";
-import { calendarDay, parseCalendarDay } from "@/lib/calendar-days";
+import { calendarDay, eventOccursOnDay, parseCalendarDay } from "@/lib/calendar-days";
 import { dragCalendarEvent, isCalendarDragging, canDragCalendarEvent } from "@/lib/calendar-drag-state";
 
 const props = defineProps<{
@@ -259,9 +259,7 @@ function getAllDayEvents(date: Date) {
     const eEnd = new Date(e.end_time);
     const isMultiDay = eEnd.getTime() - eStart.getTime() > 24 * 60 * 60 * 1000;
     if (!e.all_day && !isMultiDay) return false;
-    const startDate = e.start_time.split("T")[0];
-    const endDate = e.end_time.split("T")[0];
-    return startDate <= dayStr && endDate >= dayStr;
+    return eventOccursOnDay(e, dayStr, uiStore.displayTimezone);
   });
 }
 

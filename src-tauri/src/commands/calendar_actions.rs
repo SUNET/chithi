@@ -1212,9 +1212,10 @@ async fn create_with_backends(
             &creation.destination.remote_calendar_id,
         ) {
             let backend = backend_for(&account, backends)?;
-            let current = backend
+            let mut current = backend
                 .fetch_event_set(&context(state), &account, &canonical.event, remote)
                 .await?;
+            current.retain_verified_plain_descriptions(canonical)?;
             verify_created(&current, &creation.desired, remote, backend.protocol())?;
             creation.canonical = Some(current);
         }
@@ -1359,9 +1360,10 @@ fn verify_created(
             })
         || !semantic_eq(canonical, desired)
     {
-        return Err(invalid(
-            "destination has not been verified as the complete requested event set",
-        ));
+        return Err(invalid(&format!(
+            "destination has not been verified as the complete requested event set ({})",
+            recovery_difference_summary(canonical, desired, None)
+        )));
     }
     Ok(())
 }
@@ -1414,18 +1416,20 @@ fn recovery_difference_summary(
     selected_key: Option<&str>,
 ) -> String {
     let fields = match (
-        selected_event(left, selected_key).map(|event| event_fields(&event)),
-        selected_event(right, selected_key).map(|event| event_fields(&event)),
+        selected_event(left, selected_key),
+        selected_event(right, selected_key),
     ) {
         (Ok(left), Ok(right)) => format!(
-            "selected_exists=true title={} description={} location={} start={} end={} all_day={} timezone={}",
+            "selected_exists=true title={} description={} location={} start={} end={} all_day={} timezone={} organizer={} attendees={}",
             left.title == right.title,
             left.description == right.description,
             left.location == right.location,
             left.start_time == right.start_time,
             left.end_time == right.end_time,
             left.all_day == right.all_day,
-            left.timezone == right.timezone
+            left.timezone == right.timezone,
+            left.organizer_email == right.organizer_email,
+            left.attendees_json == right.attendees_json
         ),
         _ => "selected_exists=false".to_string(),
     };

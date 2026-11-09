@@ -39,8 +39,8 @@ pub struct CalendarEventSet {
     pub event: CalendarEvent,
     pub overrides: Vec<CalendarOverride>,
     pub native: Option<NativeCalendarResource>,
-    /// Explicit private content intent survives edits, selection and local moves.
-    /// Fresh provider snapshots start with `None` and derive this from native data.
+    /// Private content provenance survives edits, transfers and verification.
+    /// Fresh provider snapshots start with `None` and derive it from native data.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<CalendarContentProvenance>,
 }
@@ -112,17 +112,70 @@ impl CalendarEventSet {
         })
     }
 
-    pub(crate) fn mark_description_plain(&mut self, key: Option<&str>) -> Result<()> {
+    fn content_provenance_mut(&mut self, key: Option<&str>) -> Result<&mut Provenance> {
         self.capture_content()?;
         let content = self.content.as_mut().expect("captured content");
-        let provenance = match key {
+        Ok(match key {
             None => &mut content.master,
             Some(key) => content
                 .overrides
                 .entry(key.to_owned())
                 .or_insert_with(|| content.master.clone()),
-        };
+        })
+    }
+
+    pub(crate) fn mark_description_plain(&mut self, key: Option<&str>) -> Result<()> {
+        let provenance = self.content_provenance_mut(key)?;
         provenance.format = DescriptionFormat::Plain;
+        provenance.verified_plain_description = None;
+        Ok(())
+    }
+
+    /// The adapter must verify the rendering against the same native ID and revision.
+    pub(crate) fn record_verified_plain_description(
+        &mut self,
+        key: Option<&str>,
+        plain: &str,
+    ) -> Result<()> {
+        let native_html = super::actions::selected_event(self, key)?
+            .description
+            .unwrap_or_default()
+            .replace("\r\n", "\n");
+        let provenance = self.content_provenance_mut(key)?;
+        if provenance.format != DescriptionFormat::Html {
+            return Err(semantic_error("plain rendering requires native HTML"));
+        }
+        provenance.verified_plain_description = Some(VerifiedPlainDescription {
+            native_html,
+            plain_text: plain.replace("\r\n", "\n"),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn retain_verified_plain_descriptions(&mut self, previous: &Self) -> Result<()> {
+        let Some(content) = &previous.content else {
+            return Ok(());
+        };
+        for (key, provenance) in std::iter::once((None, &content.master)).chain(
+            content
+                .overrides
+                .iter()
+                .map(|(key, value)| (Some(key.as_str()), value)),
+        ) {
+            let Some(verified) = &provenance.verified_plain_description else {
+                continue;
+            };
+            let description = super::actions::selected_event(self, key)?
+                .description
+                .unwrap_or_default()
+                .replace("\r\n", "\n");
+            if description == verified.native_html
+                && self.description_content_type(key)? == "text/html"
+            {
+                self.content_provenance_mut(key)?.verified_plain_description =
+                    Some(verified.clone());
+            }
+        }
         Ok(())
     }
 
@@ -270,9 +323,21 @@ impl CalendarEventSet {
                 "native participant is absent from the effective projection",
             ));
         }
+        let description = event.description.unwrap_or_default().replace("\r\n", "\n");
+        let verified_plain_description = match provenance.verified_plain_description {
+            Some(verified)
+                if provenance.format == DescriptionFormat::Html
+                    && verified.native_html == description =>
+            {
+                Some(verified.plain_text)
+            }
+            Some(_) => return Err(semantic_error("plain rendering no longer matches native HTML")),
+            None => None,
+        };
         Ok(SemanticContent {
-            description: event.description.unwrap_or_default().replace("\r\n", "\n"),
+            description,
             format: provenance.format,
+            verified_plain_description,
             organizer,
             attendees,
         })
@@ -396,8 +461,16 @@ enum ParticipantRole {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct Provenance {
     format: DescriptionFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verified_plain_description: Option<VerifiedPlainDescription>,
     roles: BTreeMap<String, ParticipantRole>,
     organizer: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct VerifiedPlainDescription {
+    native_html: String,
+    plain_text: String,
 }
 
 /// Private, journal-serializable metadata; never part of a renderer DTO.
@@ -410,6 +483,7 @@ pub struct CalendarContentProvenance {
 pub(crate) struct SemanticContent {
     description: String,
     format: DescriptionFormat,
+    verified_plain_description: Option<String>,
     organizer: Option<String>,
     attendees: BTreeMap<String, (ParticipantRole, &'static str)>,
 }
@@ -422,11 +496,13 @@ impl SemanticContent {
         if self.format == other.format && self.description == other.description {
             return Ok(true);
         }
-        // A deliberately small grammar recognizes only materialized plain text.
-        // No sanitizer, tag stripping, or browser textContent proves rich fidelity.
+        // Plain equivalence requires provider verification or exact text materialization.
         let plain = |value: &Self| match value.format {
             DescriptionFormat::Plain => Some(value.description.clone()),
-            DescriptionFormat::Html => materialized_plain(&value.description),
+            DescriptionFormat::Html => value
+                .verified_plain_description
+                .clone()
+                .or_else(|| materialized_plain(&value.description)),
         };
         Ok(matches!((plain(self), plain(other)), (Some(a), Some(b)) if a == b))
     }

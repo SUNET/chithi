@@ -14,8 +14,8 @@ import {
   chooseRescheduleScope, confirmCalendarAction,
 } from "@/lib/calendar-action-confirmation";
 import * as api from "@/lib/tauri";
-import { calendarDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
-import { getDateInTimezone } from "@/lib/datetime";
+import { addCalendarDays, calendarDay, eventOccursOnDay, monthGridDays, parseCalendarDay } from "@/lib/calendar-days";
+import { getDateInTimezone, getHourInTimezone, getMinutesInTimezone, startOfDayUTC } from "@/lib/datetime";
 import { useUiStore } from "@/stores/ui";
 import CalendarSidebar from "@/components/calendar/CalendarSidebar.vue";
 import ArchivedGraphNotice from "@/components/calendar/ArchivedGraphNotice.vue";
@@ -124,10 +124,10 @@ function calendarColor(event: CalendarEvent): string {
 }
 
 function positionedEventsForDay(date: Date): PositionedEvent[] {
-  const day = new Date(date);
-  day.setHours(0, 0, 0, 0);
-  const nextDay = new Date(day);
-  nextDay.setDate(day.getDate() + 1);
+  const dayStr = calendarDay(date);
+  const timezone = uiStore.displayTimezone;
+  const day = new Date(startOfDayUTC(dayStr, timezone));
+  const nextDay = new Date(startOfDayUTC(addCalendarDays(dayStr, 1), timezone));
 
   const positioned: PositionedEvent[] = [];
   for (const ev of calendarStore.visibleEvents) {
@@ -138,7 +138,8 @@ function positionedEventsForDay(date: Date): PositionedEvent[] {
     // Clamp to this day so multi-day events render sanely.
     const segStart = start < day ? day : start;
     const segEnd = end > nextDay ? nextDay : end;
-    const startHour = (segStart.getTime() - day.getTime()) / (1000 * 60 * 60);
+    const startHour = getHourInTimezone(segStart.toISOString(), timezone) +
+      getMinutesInTimezone(segStart.toISOString(), timezone) / 60;
     const durationHours = (segEnd.getTime() - segStart.getTime()) / (1000 * 60 * 60);
     positioned.push({
       event: ev,
@@ -151,11 +152,8 @@ function positionedEventsForDay(date: Date): PositionedEvent[] {
 }
 
 function allDayEventsForDay(date: Date): CalendarEvent[] {
-  return calendarStore.visibleEvents.filter((ev) => {
-    if (!ev.all_day) return false;
-    const start = new Date(ev.start_time);
-    return isSameDate(start, date);
-  });
+  return calendarStore.visibleEvents.filter((ev) =>
+    ev.all_day && eventOccursOnDay(ev, calendarDay(date), uiStore.displayTimezone));
 }
 
 // Month-view cells
@@ -169,9 +167,8 @@ const monthCells = computed<MonthCell[]>(() => {
   const anchor = parseCalendarDay(calendarStore.displayDate);
   const monthIdx = anchor.getMonth();
   return monthGridDays(calendarStore.displayDate, 0, true).map((d) => {
-    const dayEvents = calendarStore.visibleEvents.filter((ev) => {
-      return getDateInTimezone(ev.start_time, uiStore.displayTimezone) === calendarDay(d);
-    });
+    const dayEvents = calendarStore.visibleEvents.filter((ev) =>
+      eventOccursOnDay(ev, calendarDay(d), uiStore.displayTimezone));
     return {
       date: d,
       inMonth: d.getMonth() === monthIdx,
@@ -181,9 +178,9 @@ const monthCells = computed<MonthCell[]>(() => {
 });
 
 function todayEvents(): CalendarEvent[] {
-  const today = new Date();
+  const today = getDateInTimezone(new Date().toISOString(), uiStore.displayTimezone);
   return calendarStore.visibleEvents
-    .filter((ev) => isSameDate(new Date(ev.start_time), today))
+    .filter((ev) => eventOccursOnDay(ev, today, uiStore.displayTimezone))
     .sort((a, b) => new Date(a.start_time).getTime() - new Date(b.start_time).getTime());
 }
 
@@ -191,6 +188,8 @@ function formatTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
+    timeZone: uiStore.displayTimezone,
+    hour12: uiStore.hour12,
   });
 }
 
@@ -631,6 +630,20 @@ onMounted(() => {
           <span class="week-dow">{{ d.toLocaleDateString(undefined, { weekday: "short" }).slice(0, 2) }}</span>
           <span class="week-date-pill">{{ d.getDate() }}</span>
         </button>
+      </div>
+
+      <div v-if="weekDates().some((d) => allDayEventsForDay(d).length)" class="week-all-day">
+        <div class="hour-column"></div>
+        <div v-for="d in weekDates()" :key="calendarDay(d)" class="week-all-day-cell">
+          <button
+            v-for="ev in allDayEventsForDay(d)"
+            :key="ev.id"
+            class="all-day-chip"
+            :style="{ background: calendarColor(ev) }"
+            :title="ev.title"
+            @click="onMobileEventClick(ev)"
+          >{{ ev.title || '(No title)' }}</button>
+        </div>
       </div>
 
       <div ref="weekGridRef" class="week-grid">
@@ -1186,6 +1199,27 @@ onMounted(() => {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+}
+
+.week-all-day {
+  display: flex;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--color-border);
+}
+
+.week-all-day-cell {
+  flex: 1;
+  min-width: 0;
+  padding: 2px;
+  border-left: 1px solid var(--color-border);
+}
+
+.week-all-day-cell .all-day-chip {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* The hour-column carries the in-flow 1056px height (24 × 44px hour-slots);

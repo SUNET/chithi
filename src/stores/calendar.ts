@@ -208,8 +208,12 @@ export const useCalendarStore = defineStore("calendar", () => {
             ...event,
             id: occurrenceId(event.id, occurrence.start),
             recurrence_kind: "occurrence",
-            start_time: occurrence.start.toISOString(),
-            end_time: occurrence.end.toISOString(),
+            start_time: event.all_day
+              ? occurrence.start.toISOString().slice(0, 10)
+              : occurrence.start.toISOString(),
+            end_time: event.all_day
+              ? occurrence.end.toISOString().slice(0, 10)
+              : occurrence.end.toISOString(),
           });
         }
       } else if (

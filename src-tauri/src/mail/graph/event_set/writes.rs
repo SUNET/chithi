@@ -508,13 +508,18 @@ impl GraphClient {
         Ok(current)
     }
 
-    async fn verify_creation_master(
+    async fn verify_creation_component(
         &self,
-        current: &CalendarEventSet,
+        current: &mut CalendarEventSet,
         desired: &CalendarEventSet,
+        key: Option<&str>,
     ) -> Result<()> {
-        let actual = payload(&current.event, current.native.as_ref())?;
-        let expected = payload(&desired.event, desired.native.as_ref())?;
+        let selected_current = key.map(|key| current.standalone_at(key)).transpose()?;
+        let selected_desired = key.map(|key| desired.standalone_at(key)).transpose()?;
+        let actual_component = selected_current.as_ref().unwrap_or(&*current);
+        let desired_component = selected_desired.as_ref().unwrap_or(desired);
+        let actual = payload(&actual_component.event, actual_component.native.as_ref())?;
+        let expected = payload(&desired_component.event, desired_component.native.as_ref())?;
         for field in ["subject", "isAllDay", "attendees"] {
             if actual[field] != expected[field] {
                 return Err(invalid(format!(
@@ -523,10 +528,14 @@ impl GraphClient {
             }
         }
         for field in ["start", "end"] {
-            if native_time(&actual[field])? != native_time(&expected[field])?
-                || zone(required_string(&actual[field], "timeZone")?)?
-                    != zone(required_string(&expected[field], "timeZone")?)?
-            {
+            let matches = if desired_component.event.all_day {
+                actual[field]["dateTime"] == expected[field]["dateTime"]
+            } else {
+                native_time(&actual[field])? == native_time(&expected[field])?
+                    && zone(required_string(&actual[field], "timeZone")?)?
+                        == zone(required_string(&expected[field], "timeZone")?)?
+            };
+            if !matches {
                 return Err(invalid(format!(
                     "created/reconciled master differs in {field}"
                 )));
@@ -534,8 +543,11 @@ impl GraphClient {
         }
         let normalize_recurrence = |mut recurrence: Value| -> Result<Value> {
             if !recurrence.is_null() {
-                let tz = zone(required_string(&recurrence["range"], "recurrenceTimeZone")?)?;
-                recurrence["range"]["recurrenceTimeZone"] = json!(tz.name());
+                recurrence["range"]["recurrenceTimeZone"] = if desired_component.event.all_day {
+                    Value::Null
+                } else {
+                    json!(zone(required_string(&recurrence["range"], "recurrenceTimeZone")?)?.name())
+                };
             }
             Ok(recurrence)
         };
@@ -551,7 +563,7 @@ impl GraphClient {
             if expected["body"]["contentType"] != "text" {
                 return Err(invalid("created/reconciled master HTML body differs"));
             }
-            let native = current
+            let native = actual_component
                 .native
                 .as_ref()
                 .ok_or_else(|| invalid("missing created identity"))?;
@@ -574,20 +586,26 @@ impl GraphClient {
             {
                 return Err(invalid("created/reconciled master text body differs"));
             }
+            current.record_verified_plain_description(
+                key,
+                value["body"]["content"]
+                    .as_str()
+                    .ok_or_else(|| invalid("missing verified text body"))?,
+            )?;
         }
         Ok(())
     }
 
     async fn verify_created_overrides(
         &self,
-        current: &CalendarEventSet,
+        current: &mut CalendarEventSet,
         desired: &CalendarEventSet,
     ) -> Result<()> {
         if current.overrides.len() != desired.overrides.len() {
             return Err(invalid("created set has unexpected or missing overrides"));
         }
         if !desired.overrides.is_empty() {
-            self.verify_creation_master(current, desired).await?;
+            self.verify_creation_component(current, desired, None).await?;
         }
         for expected in &desired.overrides {
             let actual = current
@@ -598,11 +616,8 @@ impl GraphClient {
             match (&actual.event, &expected.event) {
                 (None, None) => {}
                 (Some(_), Some(_)) => {
-                    self.verify_creation_master(
-                        &current.standalone_at(&actual.original_start)?,
-                        &desired.standalone_at(&expected.original_start)?,
-                    )
-                    .await?;
+                    self.verify_creation_component(current, desired, Some(&expected.original_start))
+                        .await?;
                 }
                 _ => return Err(invalid("created override/exclusion state differs")),
             }
@@ -773,13 +788,13 @@ impl GraphClient {
         template.account_id = account.into();
         template.remote_id = None;
         template.etag = None;
-        if let Some(existing) = self
+        if let Some(mut existing) = self
             .reconcile_creation(calendar, &operation, &intent, &template)
             .await?
         {
-            self.verify_creation_master(&existing, desired).await?;
-            let created = self.apply_overrides(existing, desired, false).await?;
-            self.verify_created_overrides(&created, desired).await?;
+            self.verify_creation_component(&mut existing, desired, None).await?;
+            let mut created = self.apply_overrides(existing, desired, false).await?;
+            self.verify_created_overrides(&mut created, desired).await?;
             return Ok(created);
         }
         body["transactionId"] = json!(operation);
@@ -793,7 +808,7 @@ impl GraphClient {
                 None,
             )
             .await;
-        let current = match created {
+        let mut current = match created {
             Ok(value) => match required_string(&value, "id") {
                 Ok(id) => {
                     self.fetch_calendar_event_set(calendar, id, &template)
@@ -809,9 +824,9 @@ impl GraphClient {
                 .await?
                 .ok_or(error)?,
         };
-        self.verify_creation_master(&current, desired).await?;
-        let created = self.apply_overrides(current, desired, false).await?;
-        self.verify_created_overrides(&created, desired).await?;
+        self.verify_creation_component(&mut current, desired, None).await?;
+        let mut created = self.apply_overrides(current, desired, false).await?;
+        self.verify_created_overrides(&mut created, desired).await?;
         Ok(created)
     }
 }
