@@ -19,15 +19,15 @@ export type SortColumn = "subject" | "from" | "date" | "flagged";
 
 export const useMessagesStore = defineStore("messages", () => {
   const messages = ref<MessageSummary[]>([]);
-  // Threads default to expanded; only collapsed IDs are persisted.
-  const COLLAPSED_KEY = "chithi-collapsed-threads";
+  const EXPANDED_KEY = "chithi-expanded-threads";
   const threads = ref<ThreadSummary[]>([]);
-  const collapsedThreads = ref<string[]>(loadCollapsedThreads());
+  const expandedThreads = ref<string[]>(loadExpandedThreads());
   const threadMessages = ref<Record<string, MessageSummary[]>>({});
 
-  function loadCollapsedThreads(): string[] {
+  function loadExpandedThreads(): string[] {
     try {
-      const raw = localStorage.getItem(COLLAPSED_KEY);
+      localStorage.removeItem("chithi-collapsed-threads");
+      const raw = localStorage.getItem(EXPANDED_KEY);
       const parsed: unknown = raw ? JSON.parse(raw) : [];
       return Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : [];
     } catch {
@@ -35,16 +35,16 @@ export const useMessagesStore = defineStore("messages", () => {
     }
   }
 
-  function persistCollapsedThreads() {
+  function persistExpandedThreads() {
     try {
-      localStorage.setItem(COLLAPSED_KEY, JSON.stringify(collapsedThreads.value));
+      localStorage.setItem(EXPANDED_KEY, JSON.stringify(expandedThreads.value));
     } catch {
-      // In-memory collapse state remains usable without storage.
+      // In-memory expansion state remains usable without storage.
     }
   }
 
   function isThreadExpanded(threadId: string): boolean {
-    return !collapsedThreads.value.includes(threadId);
+    return expandedThreads.value.includes(threadId);
   }
 
   const activeMessage = ref<MessageBody | null>(null);
@@ -279,7 +279,7 @@ export const useMessagesStore = defineStore("messages", () => {
     const pending = targets.filter(
       (thread) =>
         thread.message_count > 1 &&
-        !collapsedThreads.value.includes(thread.thread_id) &&
+        expandedThreads.value.includes(thread.thread_id) &&
         !threadMessages.value[thread.thread_id],
     );
     if (pending.length === 0) return;
@@ -350,9 +350,11 @@ export const useMessagesStore = defineStore("messages", () => {
   }
 
   async function toggleThread(threadId: string) {
-    const index = collapsedThreads.value.indexOf(threadId);
+    const index = expandedThreads.value.indexOf(threadId);
     if (index !== -1) {
-      collapsedThreads.value.splice(index, 1);
+      expandedThreads.value.splice(index, 1);
+    } else {
+      expandedThreads.value = [...expandedThreads.value, threadId];
       if (!threadMessages.value[threadId]) {
         const accountId = accountsStore.activeAccountId;
         const folderPath = foldersStore.activeFolderPath;
@@ -370,14 +372,14 @@ export const useMessagesStore = defineStore("messages", () => {
           } catch (error) {
             // Roll back failed expansion so it remains retryable.
             console.error("toggleThread: failed to load thread children", error);
-            collapsedThreads.value = [...collapsedThreads.value, threadId];
+            expandedThreads.value = expandedThreads.value.filter(
+              (candidate) => candidate !== threadId,
+            );
           }
         }
       }
-    } else {
-      collapsedThreads.value = [...collapsedThreads.value, threadId];
     }
-    persistCollapsedThreads();
+    persistExpandedThreads();
   }
 
   async function showAsThread(messageId: string) {
@@ -396,10 +398,9 @@ export const useMessagesStore = defineStore("messages", () => {
         ...threadMessages.value,
         [messageId]: threadMembers,
       };
-      const index = collapsedThreads.value.indexOf(messageId);
-      if (index !== -1) {
-        collapsedThreads.value.splice(index, 1);
-        persistCollapsedThreads();
+      if (!expandedThreads.value.includes(messageId)) {
+        expandedThreads.value = [...expandedThreads.value, messageId];
+        persistExpandedThreads();
       }
     }
   }
@@ -757,7 +758,7 @@ export const useMessagesStore = defineStore("messages", () => {
   return {
     messages,
     threads,
-    collapsedThreads,
+    expandedThreads,
     isThreadExpanded,
     threadMessages,
     activeMessage,

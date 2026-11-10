@@ -225,8 +225,7 @@ describe("Mark as read", () => {
     store.threadMessages = {
       t1: [makeSummary("msg1", []), makeSummary("msg2", ["seen"])],
     };
-    // Threads are expanded by default; clear any persisted collapse state.
-    store.collapsedThreads = [];
+    store.expandedThreads = ["t1"];
 
     store.selectMessage("msg1", noMod);
 
@@ -293,7 +292,7 @@ describe("Threaded Shift+click range selection", () => {
     store.threadMessages = {
       t1: [makeSummary("msg1"), makeSummary("msg2"), makeSummary("msg3")],
     };
-    store.collapsedThreads = []; // expanded
+    store.expandedThreads = ["t1"];
 
     store.selectMessage("msg1", noMod); // ThreadRow header
     store.selectMessage("msg3", shift); // last reply row
@@ -311,7 +310,7 @@ describe("Threaded Shift+click range selection", () => {
     store.threadMessages = {
       t1: [makeSummary("msg1"), makeSummary("msg2")],
     };
-    store.collapsedThreads = [];
+    store.expandedThreads = ["t1"];
 
     store.selectMessage("msg1", noMod);
     store.selectMessage("msg3", shift);
@@ -329,7 +328,7 @@ describe("Threaded Shift+click range selection", () => {
       t1: [makeSummary("msg1"), makeSummary("msg2")],
       t2: [makeSummary("msg3"), makeSummary("msg4")],
     };
-    store.collapsedThreads = ["t1"]; // t1 collapsed, t2 expanded
+    store.expandedThreads = ["t2"];
 
     store.selectMessage("msg1", noMod);
     store.selectMessage("msg4", shift);

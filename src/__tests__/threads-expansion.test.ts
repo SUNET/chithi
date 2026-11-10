@@ -84,43 +84,55 @@ afterEach(() => {
 });
 
 describe("Thread expansion", () => {
-  it("treats threads as expanded by default", () => {
+  it("treats threads as collapsed by default", () => {
     const store = useMessagesStore();
-    expect(store.collapsedThreads).toEqual([]);
-    expect(store.isThreadExpanded("any-id")).toBe(true);
+    expect(store.expandedThreads).toEqual([]);
+    expect(store.isThreadExpanded("any-id")).toBe(false);
   });
 
-  it("loads stored collapsed list from localStorage on init", () => {
-    localStorage.setItem("chithi-collapsed-threads", JSON.stringify(["t1", "t2"]));
+  it("loads stored expanded list from localStorage on init", () => {
+    localStorage.setItem("chithi-collapsed-threads", JSON.stringify(["t3"]));
+    localStorage.setItem("chithi-expanded-threads", JSON.stringify(["t1", "t2"]));
     const store = useMessagesStore();
-    expect(store.collapsedThreads).toEqual(["t1", "t2"]);
-    expect(store.isThreadExpanded("t1")).toBe(false);
-    expect(store.isThreadExpanded("t3")).toBe(true);
+    expect(store.expandedThreads).toEqual(["t1", "t2"]);
+    expect(store.isThreadExpanded("t1")).toBe(true);
+    expect(store.isThreadExpanded("t3")).toBe(false);
+    expect(localStorage.getItem("chithi-collapsed-threads")).toBeNull();
+  });
+
+  it("toggleThread expands a collapsed thread and persists", async () => {
+    const store = useMessagesStore();
+    await store.toggleThread("t1");
+    expect(store.expandedThreads).toContain("t1");
+    expect(JSON.parse(localStorage.getItem("chithi-expanded-threads") ?? "[]"))
+      .toContain("t1");
   });
 
   it("toggleThread collapses an expanded thread and persists", async () => {
     const store = useMessagesStore();
+    store.expandedThreads = ["t1"];
+
     await store.toggleThread("t1");
-    expect(store.collapsedThreads).toContain("t1");
-    expect(JSON.parse(localStorage.getItem("chithi-collapsed-threads") ?? "[]"))
-      .toContain("t1");
+
+    expect(store.expandedThreads).not.toContain("t1");
+    expect(JSON.parse(localStorage.getItem("chithi-expanded-threads") ?? "[]"))
+      .not.toContain("t1");
   });
 
-  it("toggleThread re-expands a collapsed thread and fetches children", async () => {
+  it("toggleThread expands a collapsed thread and fetches children", async () => {
     withActiveContext();
     getThreadMessagesMock.mockResolvedValue([
       { id: "t1_0" }, { id: "t1_1" },
     ]);
     const store = useMessagesStore();
-    store.collapsedThreads = ["t1"];
 
     await store.toggleThread("t1");
-    expect(store.collapsedThreads).not.toContain("t1");
+    expect(store.expandedThreads).toContain("t1");
     expect(getThreadMessagesMock).toHaveBeenCalledWith("acc1", "INBOX", "t1");
     expect(store.threadMessages.t1).toHaveLength(2);
   });
 
-  it("fetchMessages preserves collapsedThreads across syncs", async () => {
+  it("fetchMessages preserves expandedThreads across syncs", async () => {
     withActiveContext();
     useUiStore().setThreading(true);
     getThreadedMessagesMock.mockResolvedValue({
@@ -133,10 +145,10 @@ describe("Thread expansion", () => {
     getThreadMessagesMock.mockResolvedValue([]);
 
     const store = useMessagesStore();
-    store.collapsedThreads = ["t1"];
+    store.expandedThreads = ["t1"];
 
     await store.fetchMessages();
-    expect(store.collapsedThreads).toEqual(["t1"]);
+    expect(store.expandedThreads).toEqual(["t1"]);
   });
 
   it("fetchMessages prefetches children only for expanded threads", async () => {
@@ -154,7 +166,7 @@ describe("Thread expansion", () => {
     });
 
     const store = useMessagesStore();
-    store.collapsedThreads = ["t2"];
+    store.expandedThreads = ["t1"];
 
     await store.fetchMessages();
 

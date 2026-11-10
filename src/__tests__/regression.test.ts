@@ -165,10 +165,10 @@ describe("Regression: selection", () => {
     expect(container.exists()).toBe(true);
   });
 
-  it("BUG: collapsedThreads and threadMessages must use array/object not Set/Map", () => {
+  it("BUG: expandedThreads and threadMessages must use array/object not Set/Map", () => {
     // Previously used Set/Map which caused Vue reactivity issues.
     const store = setupStores(true);
-    expect(Array.isArray(store.collapsedThreads)).toBe(true);
+    expect(Array.isArray(store.expandedThreads)).toBe(true);
     expect(typeof store.threadMessages).toBe("object");
     expect(store.threadMessages).not.toBeInstanceOf(Map);
   });
@@ -259,6 +259,32 @@ describe("Regression: selection", () => {
     });
     const subjectCollapsed = collapsed.find(".col-subject");
     expect(subjectCollapsed.classes()).toContain("bold");
+  });
+
+  it("uses an accessible button for the thread disclosure target", async () => {
+    const thread = {
+      thread_id: "t1",
+      subject: "Test thread",
+      last_date: "2026-04-09T00:00:00Z",
+      message_count: 3,
+      unread_count: 0,
+      from_name: "Alice",
+      from_email: "alice@test.com",
+      has_attachments: false,
+      flags: [],
+      snippet: null,
+      message_ids: ["m1", "m2", "m3"],
+    };
+    const wrapper = mount(ThreadRow, {
+      props: { thread, expanded: false, active: false, selected: false },
+      global: { plugins: [router] },
+    });
+
+    const disclosure = wrapper.get("button.expand-icon");
+    expect(disclosure.attributes("aria-label")).toBe("Expand thread");
+    expect(disclosure.attributes("aria-expanded")).toBe("false");
+    await disclosure.trigger("click");
+    expect(wrapper.emitted("toggle")).toHaveLength(1);
   });
 });
 

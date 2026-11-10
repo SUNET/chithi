@@ -71,10 +71,16 @@ function isReply(): boolean {
       />
     </div>
     <div class="col col-icons">
-      <span
+      <button
+        v-if="thread.message_count > 1"
+        type="button"
         class="expand-icon"
+        :aria-label="expanded ? 'Collapse thread' : 'Expand thread'"
+        :aria-expanded="expanded"
+        :title="expanded ? 'Collapse thread' : 'Expand thread'"
         @click.stop="$emit('toggle')"
-      >{{ thread.message_count > 1 ? (expanded ? '\u25BF' : '\u25B9') : '\u00A0' }}</span>
+      >{{ expanded ? '\u25BF' : '\u25B9' }}</button>
+      <span v-else class="expand-placeholder" aria-hidden="true"></span>
       <span
         class="icon-read"
         :class="{ unread: hasUnread() }"
@@ -167,7 +173,7 @@ function isReply(): boolean {
 .col-icons {
   display: flex;
   align-items: center;
-  gap: 2px;
+  gap: 0;
   width: 46px;
   flex-shrink: 0;
   padding: 0 2px;
@@ -177,6 +183,8 @@ function isReply(): boolean {
   font-size: 8px;
   color: var(--color-accent);
   visibility: hidden;
+  width: 6px;
+  text-align: center;
 }
 
 .icon-read.unread {
@@ -184,21 +192,33 @@ function isReply(): boolean {
 }
 
 .expand-icon {
+  align-self: stretch;
+  flex: 0 0 24px;
   font-size: 11px;
   color: var(--color-text-muted);
-  cursor: pointer;
-  width: 14px;
   text-align: center;
 }
 
-.expand-icon:hover {
+.expand-placeholder {
+  flex: 0 0 24px;
+}
+
+.expand-icon:hover,
+.expand-icon:focus-visible {
   color: var(--color-accent);
+}
+
+.expand-icon:focus-visible {
+  outline: 1px solid var(--color-accent);
+  outline-offset: -2px;
 }
 
 .icon-star {
   font-size: 13px;
   color: var(--color-text-muted);
   cursor: pointer;
+  width: 12px;
+  text-align: center;
 }
 
 .icon-star.starred {
