@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted, watch, nextTick } from "vue";
+import { ref, onMounted, onBeforeUnmount, watch, nextTick } from "vue";
 import { useFoldersStore } from "@/stores/folders";
 import { useAccountsStore } from "@/stores/accounts";
 import { useMessagesStore } from "@/stores/messages";
@@ -19,6 +19,7 @@ const accountMenu = ref<{ x: number; y: number; accountId: string } | null>(null
 const syncing = ref<string | null>(null);
 const collapsedAccounts = ref<string[]>([]);
 const dropTarget = ref<string | null>(null);
+const folderTreeEl = ref<HTMLElement | null>(null);
 
 // Folder collapse state persists per account.
 const collapsedFolders = ref<Record<string, string[]>>(loadCollapsedFolders());
@@ -273,6 +274,93 @@ async function createNewFolder() {
 }
 
 let dragExpandTimer: ReturnType<typeof setTimeout> | null = null;
+let dragScrollFrame: number | null = null;
+let dragScrollSpeed = 0;
+const DRAG_SCROLL_EDGE = 56;
+const DRAG_SCROLL_MAX_SPEED = 12;
+
+function stopDragAutoScroll() {
+  dragScrollSpeed = 0;
+  if (dragScrollFrame !== null) {
+    cancelAnimationFrame(dragScrollFrame);
+    dragScrollFrame = null;
+  }
+}
+
+function runDragAutoScroll() {
+  dragScrollFrame = null;
+  const container = folderTreeEl.value;
+  if (!container || !isDragging.value || dragScrollSpeed === 0) {
+    stopDragAutoScroll();
+    return;
+  }
+
+  const previous = container.scrollTop;
+  const maxScrollTop = Math.max(0, container.scrollHeight - container.clientHeight);
+  container.scrollTop = Math.max(
+    0,
+    Math.min(maxScrollTop, previous + dragScrollSpeed),
+  );
+  if (container.scrollTop === previous) {
+    stopDragAutoScroll();
+    return;
+  }
+
+  dragScrollFrame = requestAnimationFrame(runDragAutoScroll);
+}
+
+function scrollSpeed(distanceFromEdge: number): number {
+  return Math.ceil(
+    DRAG_SCROLL_MAX_SPEED * (1 - distanceFromEdge / DRAG_SCROLL_EDGE),
+  );
+}
+
+function onFolderTreeMouseMove(event: MouseEvent) {
+  const container = folderTreeEl.value;
+  if (!container || !isDragging.value) {
+    stopDragAutoScroll();
+    return;
+  }
+
+  const rect = container.getBoundingClientRect();
+  if (event.clientY < rect.top || event.clientY > rect.bottom) {
+    stopDragAutoScroll();
+    return;
+  }
+
+  const distanceFromTop = event.clientY - rect.top;
+  const distanceFromBottom = rect.bottom - event.clientY;
+  if (distanceFromTop < DRAG_SCROLL_EDGE && distanceFromTop <= distanceFromBottom) {
+    dragScrollSpeed = -scrollSpeed(distanceFromTop);
+  } else if (distanceFromBottom < DRAG_SCROLL_EDGE) {
+    dragScrollSpeed = scrollSpeed(distanceFromBottom);
+  } else {
+    stopDragAutoScroll();
+    return;
+  }
+
+  if (dragScrollFrame === null) {
+    dragScrollFrame = requestAnimationFrame(runDragAutoScroll);
+  }
+}
+
+watch(
+  () => isDragging.value,
+  (dragging) => {
+    if (dragging) return;
+    stopDragAutoScroll();
+    dropTarget.value = null;
+    if (dragExpandTimer) {
+      clearTimeout(dragExpandTimer);
+      dragExpandTimer = null;
+    }
+  },
+);
+
+onBeforeUnmount(() => {
+  stopDragAutoScroll();
+  if (dragExpandTimer) clearTimeout(dragExpandTimer);
+});
 
 function onFolderMouseEnter(accountId: string, folderPath: string) {
   if (!isDragging.value) return;
@@ -381,7 +469,13 @@ async function doDeleteFolder() {
 </script>
 
 <template>
-  <div class="folder-tree" @click="closeContextMenu">
+  <div
+    ref="folderTreeEl"
+    class="folder-tree"
+    @click="closeContextMenu"
+    @mousemove="onFolderTreeMouseMove"
+    @mouseleave="stopDragAutoScroll"
+  >
     <div class="app-sidebar-header">Mailboxes</div>
     <div
       v-for="account in accountsStore.mailAccounts"
